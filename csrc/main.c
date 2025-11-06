@@ -5,8 +5,8 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define MAX_ROWS 20
-#define MAX_COLS 10
+#define MAX_ROWS 10
+#define MAX_COLS 8
 #define CELL_WIDTH 12
 #define MAX_CELL_LEN 256
 
