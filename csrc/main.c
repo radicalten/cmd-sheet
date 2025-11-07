@@ -1,186 +1,290 @@
+/*
+ * mini_sheet.c ― a 100 % self-contained, tiny spreadsheet.
+ *
+ * 26 columns (A–Z) × 10 rows (1–10)
+ * Supports numeric constants and formulas with + - * / and parentheses.
+ *
+ * Build:   gcc mini_sheet.c -o mini_sheet
+ * Run :   ./mini_sheet
+ *
+ * Public-domain / CC0 – do whatever you like.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-#define ROWS 10
-#define COLS 10
-#define MAX_CELL_LEN 256
-#define MAX_FORMULA_LEN 256
+#define MAX_ROWS 10
+#define MAX_COLS 26
+#define MAX_EXPR 256
 
 typedef struct {
-    char content[MAX_CELL_LEN];
-    int is_formula;  // 1 if formula, 0 otherwise
-    double value;    // Cached value if numeric
+    char   expr[MAX_EXPR];  /* original text ("" ==> empty)              */
+    double val;             /* cached numeric value                      */
+    int    is_formula;      /* 0 = plain number, 1 = expression          */
+    int    evaluating;      /* recursion flag for cycle detection        */
 } Cell;
 
-Cell sheet[ROWS][COLS];
+static Cell sheet[MAX_ROWS][MAX_COLS];
 
-// Function prototypes
-void init_sheet();
-void print_sheet();
-void set_cell(int row, int col, const char* value);
-double evaluate_cell(int row, int col);
-double parse_expression(const char* expr, int* pos);
-double parse_term(const char* expr, int* pos);
-double parse_factor(const char* expr, int* pos);
-int get_row(char label);
-int get_col(const char* label);
+/* Forward declarations for the recursive-descent parser */
+static double parse_expr (const char **p, int *err);
+static double eval_cell  (int row, int col, int *err);
 
-// Main function
-int main() {
-    char command[512];
-    init_sheet();
+/* ────────────────────────────────────────────────────────── UTILITIES ─── */
 
-    printf("Simple Terminal Spreadsheet\n");
-    printf("Commands: set <cell> <value> (e.g., set A1 42 or set B2 =A1+3)\n");
-    printf("          view\n");
-    printf("          quit\n");
+static void ltrim(char *s)
+{
+    while (isspace((unsigned char)*s)) memmove(s, s+1, strlen(s));
+}
 
-    while (1) {
-        printf("> ");
-        if (fgets(command, sizeof(command), stdin) == NULL) break;
-        command[strcspn(command, "\n")] = 0;  // Remove newline
+static void rtrim(char *s)
+{
+    size_t n = strlen(s);
+    while (n && isspace((unsigned char)s[n-1])) s[--n] = '\0';
+}
 
-        if (strcmp(command, "quit") == 0) break;
-        if (strcmp(command, "view") == 0) {
-            print_sheet();
-            continue;
-        }
+static void trim(char *s) { rtrim(s); ltrim(s); }
 
-        // Parse 'set' command
-        char* token = strtok(command, " ");
-        if (token && strcmp(token, "set") == 0) {
-            char* cell = strtok(NULL, " ");
-            char* value = strtok(NULL, "");
-            if (!cell || !value || strlen(cell) < 2) {
-                printf("Invalid command. Use: set <cell> <value>\n");
-                continue;
-            }
-            int row = get_row(cell[0]);
-            char* col_str = cell + 1;
-            int col = atoi(col_str) - 1;
-            if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {
-                printf("Invalid cell: %s\n", cell);
-                continue;
-            }
-            set_cell(row, col, value);
-            printf("Set %s to '%s'\n", cell, value);
+static int parse_cell_name(const char *s, int *row, int *col)
+{
+    /* Accept  A1 .. Z10  (case-insensitive) */
+    if (!isalpha((unsigned char)s[0])) return 0;
+    *col = toupper((unsigned char)s[0]) - 'A';
+    if (*col < 0 || *col >= MAX_COLS)  return 0;
+
+    char *endptr;
+    long r = strtol(s+1, &endptr, 10);
+    if (r < 1 || r > MAX_ROWS || endptr == s+1) return 0;
+
+    if (*endptr) return 0; /* trailing junk */
+    *row = (int)r - 1;
+    return 1;
+}
+
+/* ───────────────────────────────────── PARSER: expr / term / factor ─── */
+
+static void skip_ws(const char **p)
+{
+    while (isspace((unsigned char)**p)) ++*p;
+}
+
+static double parse_factor(const char **p, int *err)
+{
+    skip_ws(p);
+    if (*err) return 0.0;
+
+    /* unary +/- */
+    if (**p == '+' || **p == '-') {
+        int sign = (**p == '-') ? -1 : 1;
+        ++*p;
+        return sign * parse_factor(p, err);
+    }
+
+    /* parenthesized expression */
+    if (**p == '(') {
+        ++*p;
+        double v = parse_expr(p, err);
+        skip_ws(p);
+        if (**p != ')') { *err = 1; return 0.0; }
+        ++*p;
+        return v;
+    }
+
+    /* number OR cell reference */
+    if (isalpha((unsigned char)**p)) {
+        char buf[16] = {0};
+        int i=0;
+        while (isalnum((unsigned char)**p) && i < 15) buf[i++] = *(*p)++;
+        buf[i] = '\0';
+        int row,col;
+        if (!parse_cell_name(buf, &row, &col)) { *err = 1; return 0.0; }
+        return eval_cell(row, col, err);
+    }
+
+    /* numeric constant */
+    if (isdigit((unsigned char)**p) || **p=='.') {
+        char *endptr;
+        double v = strtod(*p, &endptr);
+        *p = endptr;
+        return v;
+    }
+
+    *err = 1;
+    return 0.0;
+}
+
+static double parse_term(const char **p, int *err)
+{
+    double v = parse_factor(p, err);
+    while (!*err) {
+        skip_ws(p);
+        if (**p == '*' || **p == '/') {
+            char op = *(*p)++;
+            double rhs = parse_factor(p, err);
+            if (*err) return 0.0;
+            v = (op == '*') ? v * rhs : v / rhs;
         } else {
-            printf("Unknown command\n");
+            break;
         }
     }
-
-    return 0;
+    return v;
 }
 
-void init_sheet() {
-    for (int i = 0; i < ROWS; i++) {
-        for (int j = 0; j < COLS; j++) {
-            strcpy(sheet[i][j].content, "");
-            sheet[i][j].is_formula = 0;
-            sheet[i][j].value = 0.0;
+static double parse_expr(const char **p, int *err)
+{
+    double v = parse_term(p, err);
+    while (!*err) {
+        skip_ws(p);
+        if (**p == '+' || **p == '-') {
+            char op = *(*p)++;
+            double rhs = parse_term(p, err);
+            if (*err) return 0.0;
+            v = (op == '+') ? v + rhs : v - rhs;
+        } else {
+            break;
         }
     }
+    return v;
 }
 
-void print_sheet() {
-    printf("   ");
-    for (int j = 1; j <= COLS; j++) printf("%-8d", j);
+/* ────────────────────────────────── CELL EVALUATION (with caching) ─── */
+
+static double eval_cell(int row, int col, int *err)
+{
+    if (row < 0 || row >= MAX_ROWS || col < 0 || col >= MAX_COLS) {
+        *err = 1; return 0.0;
+    }
+
+    Cell *c = &sheet[row][col];
+
+    if (!c->expr[0]) return 0.0;          /* blank cell == 0 */
+    if (c->evaluating) {                  /* cycle! */
+        fprintf(stderr, "Error: circular reference at %c%d\n", col+'A', row+1);
+        *err = 1; return 0.0;
+    }
+
+    if (!c->is_formula) {                 /* plain number */
+        return c->val;
+    }
+
+    c->evaluating = 1;
+    const char *p = c->expr;
+    int local_err = 0;
+    double v = parse_expr(&p, &local_err);
+    skip_ws(&p);
+    if (*p) local_err = 1;                /* leftover junk */
+
+    if (local_err) {
+        fprintf(stderr, "Error: bad formula in %c%d: %s\n",
+                col+'A', row+1, c->expr);
+        *err = 1;
+        v = 0.0;
+    } else {
+        c->val = v;                       /* cache result */
+    }
+    c->evaluating = 0;
+    return v;
+}
+
+/* ───────────────────────────────────────────── display & helpers ─── */
+
+static void print_sheet(void)
+{
+    printf("\n        ");
+    for (int c=0; c<MAX_COLS; ++c) printf(" %6c", 'A'+c);
     printf("\n");
 
-    for (int i = 0; i < ROWS; i++) {
-        printf("%c  ", 'A' + i);
-        for (int j = 0; j < COLS; j++) {
-            if (sheet[i][j].content[0] == '\0') {
-                printf("%-8s", "");
-            } else if (sheet[i][j].is_formula) {
-                double val = evaluate_cell(i, j);
-                printf("%-8.2f", val);
-            } else if (isdigit(sheet[i][j].content[0]) || sheet[i][j].content[0] == '-' || sheet[i][j].content[0] == '.') {
-                printf("%-8.2f", atof(sheet[i][j].content));
-            } else {
-                printf("%-8s", sheet[i][j].content);
-            }
+    for (int r=0; r<MAX_ROWS; ++r)
+    {
+        printf("Row %2d ", r+1);
+        for (int c=0; c<MAX_COLS; ++c)
+        {
+            int err=0;
+            double v = eval_cell(r,c,&err);
+            if (err) printf("  #### ");
+            else if (!sheet[r][c].expr[0]) printf("       ");
+            else                           printf(" %6.2f", v);
         }
         printf("\n");
     }
+    printf("\n");
 }
 
-void set_cell(int row, int col, const char* value) {
-    strncpy(sheet[row][col].content, value, MAX_CELL_LEN - 1);
-    sheet[row][col].is_formula = (value[0] == '=');
-    if (!sheet[row][col].is_formula) {
-        sheet[row][col].value = atof(value);
-    }
+static void print_help(void)
+{
+    puts("\nMini-sheet commands:");
+    puts("  A1 = 5            (set constant)");
+    puts("  B2 = A1 * 2 + 7   (set formula)");
+    puts("  print             (show grid)");
+    puts("  help              (this help)");
+    puts("  quit / exit       (leave)");
 }
 
-double evaluate_cell(int row, int col) {
-    if (!sheet[row][col].is_formula) return sheet[row][col].value;
+/* ───────────────────────────────────────────── main loop ─── */
 
-    const char* expr = sheet[row][col].content + 1;  // Skip '='
-    int pos = 0;
-    return parse_expression(expr, &pos);
-}
+int main(void)
+{
+    char line[512];
 
-double parse_expression(const char* expr, int* pos) {
-    double result = parse_term(expr, pos);
-    while (expr[*pos] == '+' || expr[*pos] == '-') {
-        char op = expr[(*pos)++];
-        double term = parse_term(expr, pos);
-        if (op == '+') result += term;
-        else result -= term;
-    }
-    return result;
-}
+    puts("Mini-sheet 0.1  –  type 'help' for instructions.");
 
-double parse_term(const char* expr, int* pos) {
-    double result = parse_factor(expr, pos);
-    while (expr[*pos] == '*' || expr[*pos] == '/') {
-        char op = expr[(*pos)++];
-        double factor = parse_factor(expr, pos);
-        if (op == '*') result *= factor;
-        else if (factor != 0) result /= factor;
-        else return 0;  // Division by zero
-    }
-    return result;
-}
+    while (1)
+    {
+        fputs("> ", stdout);
+        if (!fgets(line, sizeof line, stdin)) break;
+        trim(line);
+        if (!*line) continue;
 
-double parse_factor(const char* expr, int* pos) {
-    while (isspace(expr[*pos])) (*pos)++;
+        /* quit? */
+        if (!strcasecmp(line, "quit") || !strcasecmp(line,"exit")) break;
 
-    if (isdigit(expr[*pos]) || expr[*pos] == '-' || expr[*pos] == '.') {
-        // Parse number
-        char* end;
-        double num = strtod(expr + *pos, &end);
-        *pos = end - expr;
-        return num;
-    } else if (isalpha(expr[*pos])) {
-        // Parse cell reference (e.g., A1)
-        char row_label = expr[(*pos)++];
-        char col_str[10];
-        int col_idx = 0;
-        while (isdigit(expr[*pos]) && col_idx < 9) {
-            col_str[col_idx++] = expr[(*pos)++];
+        /* help? */
+        if (!strcasecmp(line, "help")) { print_help(); continue; }
+
+        /* print? */
+        if (!strcasecmp(line, "print")) { print_sheet(); continue; }
+
+        /* assignment? look for '=' */
+        char *eq = strchr(line, '=');
+        if (eq)
+        {
+            *eq = '\0';
+            char lhs[32], rhs[MAX_EXPR];
+            strncpy(lhs, line, sizeof lhs-1);
+            lhs[sizeof lhs-1] = '\0';
+            strncpy(rhs, eq+1, sizeof rhs-1);
+            rhs[sizeof rhs-1] = '\0';
+            trim(lhs); trim(rhs);
+
+            int row,col;
+            if (!parse_cell_name(lhs, &row, &col)) {
+                puts("Syntax:  <Cell> = <expr>   (Cell is A1..Z10)");
+                continue;
+            }
+            Cell *c = &sheet[row][col];
+            strncpy(c->expr, rhs, MAX_EXPR-1);
+            c->expr[MAX_EXPR-1]='\0';
+
+            /* decide if it's a plain number */
+            char *endptr; double v = strtod(rhs,&endptr);
+            trim(endptr);
+            if (*rhs && !*endptr) {           /* pure numeric */
+                c->is_formula = 0;
+                c->val = v;
+            } else {
+                c->is_formula = 1;
+            }
+
+            int err=0; (void)eval_cell(row,col,&err);
+            if (!err)
+                printf("%s = %g\n", lhs, c->val);
+            continue;
         }
-        col_str[col_idx] = '\0';
-        int r = get_row(row_label);
-        int c = atoi(col_str) - 1;
-        if (r >= 0 && r < ROWS && c >= 0 && c < COLS) {
-            return evaluate_cell(r, c);
-        } else {
-            return 0;  // Invalid reference
-        }
-    } else if (expr[*pos] == '(') {
-        (*pos)++;  // Skip '('
-        double sub = parse_expression(expr, pos);
-        if (expr[*pos] == ')') (*pos)++;
-        return sub;
-    }
-    return 0;  // Error
-}
 
-int get_row(char label) {
-    if (label >= 'A' && label <= 'J') return label - 'A';
-    return -1;
+        puts("Unknown command. Type 'help'.");
+    }
+
+    puts("Bye.");
+    return 0;
 }
