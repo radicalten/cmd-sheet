@@ -1,706 +1,386 @@
-// minisheet.c - a tiny terminal spreadsheet (single-file, no deps)
-// Build: cc -std=c99 -O2 -Wall -Wextra -o minisheet minisheet.c
-// Runs on POSIX terminals (Linux/macOS). Windows not supported.
-// Features:
-// - 26 columns (A-Z), 100 rows
-// - Arrow key navigation, edit values/formulas, save/load
-// - Formulas start with '=' and support + - * /, parentheses, and cell refs (A1..Z100)
-// - Errors: PARSE, BADREF, DIV/0, CYCLE (propagated)
-// - Simple file format: lines "row col escaped_text\n" (0-based row/col)
-//   Escapes: \n, \t, \\
-
-// Disclaimer: this is educational/minimal, not bulletproof. Keep backups!
-
-#define _XOPEN_SOURCE 600
-#include <ctype.h>
-#include <errno.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdint.h>
+/******************************************************************************
+ * tcalc.c - A Simple Terminal-Based Spreadsheet Program
+ *
+ * Author: A helpful AI assistant
+ * Date: 2023
+ *
+ * A single-file, dependency-free C program that mimics the basic
+ * functionality of early spreadsheet software like VisiCalc in the terminal.
+ *
+ * Features:
+ * - A grid of cells with addresses (A1, B2, etc.).
+ * - Navigation with 'w', 'a', 's', 'd'.
+ * - Data entry for text, numbers, and formulas.
+ * - Formulas start with '=' and support one binary operator (+, -, *, /).
+ *   Examples: =A1+B2, =C1*10, =50/2
+ * - Automatic recalculation of all cells.
+ * - Circular dependency detection.
+ * - Error reporting for syntax, value, division by zero, and circular refs.
+ * - Quit with 'q' or 'quit'.
+ *
+ * Compilation:
+ *   gcc -o tcalc tcalc.c -lm
+ *
+ * Usage:
+ *   ./tcalc
+ *
+ *****************************************************************************/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <termios.h>
-#include <unistd.h>
+#include <ctype.h>
+#include <math.h>
 
-#define MAX_ROWS 100
-#define MAX_COLS 26
-#define CELL_TEXT_LEN 128
+// --- Configuration ---
+#define COLS 8
+#define ROWS 15
+#define CELL_WIDTH 10
+#define INPUT_BUFFER_SIZE 256
+#define MAX_EXPR_LEN (INPUT_BUFFER_SIZE - 1)
 
-typedef struct {
-    char text[CELL_TEXT_LEN]; // empty => empty cell; starts with '=' => formula
-    double value;             // last computed numeric value
-    int evaluated;            // 1 if value/err computed for this frame
-    int evaluating;           // 1 if computing (cycle detection)
-    int err;                  // error code for last eval
+// --- Error Types ---
+#define NO_ERROR 0
+#define ERROR_SYNTAX 1
+#define ERROR_CIRCULAR_REFERENCE 2
+#_define ERROR_BAD_REFERENCE 3 // Currently folded into SYNTAX
+#define ERROR_DIV_BY_ZERO 4
+#define ERROR_VALUE 5 // e.g., trying to do math on text
+
+// --- Cell Structure ---
+typedef struct Cell {
+    char expression[MAX_EXPR_LEN + 1]; // What the user typed, e.g., "=A1+B2"
+    char display[CELL_WIDTH + 1];      // What is shown in the grid
+    double value;                      // The numeric value if it's a number/formula
+    int error;                         // Error state of the cell
+    int needs_recalc;                  // Flag to trigger recalculation
 } Cell;
 
-enum {
-    ERR_NONE = 0,
-    ERR_PARSE = 1,
-    ERR_BADREF = 2,
-    ERR_DIV0 = 3,
-    ERR_CYCLE = 4,
-    ERR_DEP = 5
-};
+// --- Global State ---
+Cell grid[ROWS][COLS];
+int currentRow = 0;
+int currentCol = 0;
+// For circular reference detection during a single evaluation pass
+int evaluation_path[ROWS][COLS];
 
-static const char* err_name(int e) {
-    switch (e) {
-        case ERR_NONE: return "";
-        case ERR_PARSE: return "PARSE";
-        case ERR_BADREF: return "BADREF";
-        case ERR_DIV0: return "DIV/0";
-        case ERR_CYCLE: return "CYCLE";
-        case ERR_DEP: return "DEPERR";
-    }
-    return "ERR";
-}
+// --- Forward Declarations ---
+void initializeGrid();
+void clearScreen();
+void drawGrid();
+void handleInput();
+void updateAllCells();
+void evaluateCell(int r, int c);
+double parseExpression(const char* expr, int* error_code);
+double getCellValue(int r, int c, int* error_code);
 
-static Cell sheet[MAX_ROWS][MAX_COLS];
+// --- Main Program Loop ---
+int main() {
+    initializeGrid();
+    int running = 1;
 
-static int cur_row = 0, cur_col = 0;
-static int row_off = 0, col_off = 0;
-static int screen_rows = 24, screen_cols = 80;
-static char status_msg[256] = "";
-static char last_file[256] = "";
-
-static struct termios orig_termios;
-
-static void die_cleanup(void) {
-    // Restore terminal
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-    // Show cursor
-    write(STDOUT_FILENO, "\x1b[?25h\x1b[0m", 9);
-}
-
-static void die(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    char buf[1024];
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    die_cleanup();
-    write(STDERR_FILENO, buf, strlen(buf));
-    write(STDERR_FILENO, "\n", 1);
-    exit(1);
-}
-
-static void enable_raw_mode(void) {
-    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) die("tcgetattr: %s", strerror(errno));
-    atexit(die_cleanup);
-    struct termios raw = orig_termios;
-    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= ~(OPOST);
-    raw.c_cflag |=  (CS8);
-    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr: %s", strerror(errno));
-}
-
-static void get_window_size(void) {
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
-        screen_rows = 24;
-        screen_cols = 80;
-    } else {
-        screen_rows = ws.ws_row;
-        screen_cols = ws.ws_col;
-    }
-}
-
-static void handle_sigwinch(int sig) {
-    (void)sig;
-    get_window_size();
-}
-
-enum {
-    KEY_NULL = 0,
-    KEY_CTRL_C = 3,
-    KEY_CTRL_G = 7,
-    KEY_BACKSPACE = 127,
-    KEY_ENTER = 1000,
-    KEY_ARROW_LEFT,
-    KEY_ARROW_RIGHT,
-    KEY_ARROW_UP,
-    KEY_ARROW_DOWN,
-    KEY_DEL,
-    KEY_HOME,
-    KEY_END,
-    KEY_PAGE_UP,
-    KEY_PAGE_DOWN,
-    KEY_SHIFT_TAB
-};
-
-static int read_key(void) {
-    char c;
-    ssize_t nread = read(STDIN_FILENO, &c, 1);
-    if (nread != 1) return KEY_NULL;
-    if (c == '\r' || c == '\n') return KEY_ENTER;
-    if (c == '\t') return '\t';
-    if (c == 0x1b) {
-        char seq[6] = {0};
-        // Try read up to 5 bytes of escape sequence
-        int i = 0;
-        ioctl(STDIN_FILENO, FIONREAD, &i);
-        if (i == 0) return 0x1b;
-        int r = read(STDIN_FILENO, seq, sizeof(seq)-1);
-        if (r <= 0) return 0x1b;
-        // CSI sequences
-        if (seq[0] == '[') {
-            if (seq[1] >= '0' && seq[1] <= '9') {
-                if (seq[2] == '~') {
-                    switch (seq[1]) {
-                        case '1': return KEY_HOME;
-                        case '3': return KEY_DEL;
-                        case '4': return KEY_END;
-                        case '5': return KEY_PAGE_UP;
-                        case '6': return KEY_PAGE_DOWN;
-                        case '7': return KEY_HOME;
-                        case '8': return KEY_END;
-                    }
-                } else if (seq[2] == ';' && seq[4] == '~') {
-                    // e.g., 1;2Z for shift-tab in some terms
-                    if (seq[1] == '1' && seq[3] == '2' && seq[4] == 'Z') return KEY_SHIFT_TAB;
-                }
-            } else {
-                switch (seq[1]) {
-                    case 'A': return KEY_ARROW_UP;
-                    case 'B': return KEY_ARROW_DOWN;
-                    case 'C': return KEY_ARROW_RIGHT;
-                    case 'D': return KEY_ARROW_LEFT;
-                    case 'H': return KEY_HOME;
-                    case 'F': return KEY_END;
-                    case 'Z': return KEY_SHIFT_TAB; // shift-tab in some terms
-                }
-            }
-        } else if (seq[0] == 'O') {
-            switch (seq[1]) {
-                case 'H': return KEY_HOME;
-                case 'F': return KEY_END;
-            }
-        }
-        return KEY_NULL;
-    }
-    if (c == 127) return KEY_BACKSPACE;
-    return (unsigned char)c;
-}
-
-static inline char col_name(int c) { return (char)('A' + c); }
-
-static void cell_label(int r, int c, char out[8]) {
-    // single-letter columns A-Z only
-    snprintf(out, 8, "%c%d", col_name(c), r + 1);
-}
-
-static bool parse_cell_label(const char* s, int* out_r, int* out_c) {
-    if (!s || !isalpha((unsigned char)*s)) return false;
-    char ch = toupper((unsigned char)*s++);
-    if (ch < 'A' || ch > 'Z') return false;
-    int c = ch - 'A';
-    if (!isdigit((unsigned char)*s)) return false;
-    long row = strtol(s, NULL, 10);
-    if (row < 1 || row > MAX_ROWS) return false;
-    *out_c = c;
-    *out_r = (int)row - 1;
-    return true;
-}
-
-static void clear_eval_flags(void) {
-    for (int r = 0; r < MAX_ROWS; ++r)
-        for (int c = 0; c < MAX_COLS; ++c) {
-            sheet[r][c].evaluated = 0;
-            sheet[r][c].evaluating = 0;
-            sheet[r][c].err = 0;
-        }
-}
-
-typedef struct {
-    const char* s;
-} Parser;
-
-static void p_skip(Parser* p) {
-    while (isspace((unsigned char)*p->s)) p->s++;
-}
-
-static double eval_cell(int r, int c); // forward
-
-static double parse_expr(Parser* p, int* err); // forward
-
-static bool parse_cellref(Parser* p, int* rr, int* cc) {
-    p_skip(p);
-    const char* start = p->s;
-    if (!isalpha((unsigned char)*p->s)) return false;
-    char ch = toupper((unsigned char)*p->s++);
-    if (ch < 'A' || ch > 'Z') { p->s = start; return false; }
-    int col = ch - 'A';
-    if (!isdigit((unsigned char)*p->s)) { p->s = start; return false; }
-    long row = strtol(p->s, (char**)&p->s, 10);
-    if (row < 1 || row > MAX_ROWS) { p->s = start; return false; }
-    *rr = (int)row - 1;
-    *cc = col;
-    return true;
-}
-
-static double parse_factor(Parser* p, int* err) {
-    if (*err) return 0.0;
-    p_skip(p);
-    const char* s = p->s;
-    if (*s == '(') {
-        p->s++;
-        double v = parse_expr(p, err);
-        p_skip(p);
-        if (*p->s != ')') { *err = ERR_PARSE; return 0.0; }
-        p->s++;
-        return v;
-    }
-    if (*s == '+') { p->s++; return parse_factor(p, err); }
-    if (*s == '-') { p->s++; return -parse_factor(p, err); }
-    int rr, cc;
-    if (parse_cellref(p, &rr, &cc)) {
-        if (rr < 0 || rr >= MAX_ROWS || cc < 0 || cc >= MAX_COLS) {
-            *err = ERR_BADREF; return 0.0;
-        }
-        double v = eval_cell(rr, cc);
-        if (sheet[rr][cc].err != ERR_NONE) *err = sheet[rr][cc].err;
-        return v;
-    }
-    // number
-    char* end = NULL;
-    double v = strtod(p->s, &end);
-    if (end == p->s) { *err = ERR_PARSE; return 0.0; }
-    p->s = end;
-    return v;
-}
-
-static double parse_term(Parser* p, int* err) {
-    double v = parse_factor(p, err);
-    for (;;) {
-        p_skip(p);
-        if (*err) return 0.0;
-        if (*p->s == '*') {
-            p->s++;
-            double r = parse_factor(p, err);
-            v *= r;
-        } else if (*p->s == '/') {
-            p->s++;
-            double r = parse_factor(p, err);
-            if (r == 0.0) { *err = ERR_DIV0; return 0.0; }
-            v /= r;
-        } else break;
-    }
-    return v;
-}
-
-static double parse_expr(Parser* p, int* err) {
-    double v = parse_term(p, err);
-    for (;;) {
-        p_skip(p);
-        if (*err) return 0.0;
-        if (*p->s == '+') {
-            p->s++;
-            double r = parse_term(p, err);
-            v += r;
-        } else if (*p->s == '-') {
-            p->s++;
-            double r = parse_term(p, err);
-            v -= r;
-        } else break;
-    }
-    return v;
-}
-
-static double eval_cell(int r, int c) {
-    Cell* cell = &sheet[r][c];
-    if (cell->evaluated) return cell->value;
-    if (cell->evaluating) { cell->err = ERR_CYCLE; cell->value = 0.0; cell->evaluated = 1; return 0.0; }
-    cell->evaluating = 1;
-    cell->err = ERR_NONE;
-    if (cell->text[0] == '=') {
-        Parser p = { .s = cell->text + 1 };
-        double v = parse_expr(&p, &cell->err);
-        p_skip(&p);
-        if (*p.s != '\0' && cell->err == ERR_NONE) cell->err = ERR_PARSE;
-        if (cell->err != ERR_NONE) v = 0.0;
-        cell->value = v;
-    } else if (cell->text[0] == '\0') {
-        cell->value = 0.0;
-    } else {
-        char* end = NULL;
-        double v = strtod(cell->text, &end);
-        if (end && *end == '\0') {
-            cell->value = v;
-        } else {
-            // Treat plain text as 0 for formula math
-            cell->value = 0.0;
-        }
-    }
-    cell->evaluated = 1;
-    cell->evaluating = 0;
-    return cell->value;
-}
-
-static void statusf(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(status_msg, sizeof(status_msg), fmt, ap);
-    va_end(ap);
-}
-
-// tiny helper to clamp
-static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
-
-static void draw_screen(void) {
-    get_window_size();
-    int left_w = 5;         // width for row numbers (e.g., " 100 ")
-    int cell_w = 10;        // cell width
-    int top_h = 1;          // header row
-    int bot_h = 1;          // status bar
-    int grid_h = screen_rows - top_h - bot_h;
-    if (grid_h < 1) grid_h = 1;
-    if (screen_cols < left_w + 3) left_w = screen_cols > 3 ? screen_cols - 3 : screen_cols;
-
-    int avail_cols = screen_cols - left_w;
-    int vis_cols = avail_cols > 0 ? (avail_cols / cell_w) : 0;
-    if (vis_cols < 1) vis_cols = 1;
-    if (vis_cols > MAX_COLS) vis_cols = MAX_COLS;
-
-    int vis_rows = grid_h;
-    if (vis_rows > MAX_ROWS) vis_rows = MAX_ROWS;
-
-    // keep cursor cell in view
-    if (cur_row < row_off) row_off = cur_row;
-    if (cur_col < col_off) col_off = cur_col;
-    if (cur_row >= row_off + vis_rows) row_off = cur_row - vis_rows + 1;
-    if (cur_col >= col_off + vis_cols) col_off = cur_col - vis_cols + 1;
-
-    // clear eval state
-    clear_eval_flags();
-
-    // hide cursor and home
-    write(STDOUT_FILENO, "\x1b[?25l\x1b[H", 9);
-
-    // Header row
-    {
-        // left gutter
-        char buf[64];
-        memset(buf, ' ', sizeof(buf));
-        int n = left_w;
-        if (n > (int)sizeof(buf)) n = (int)sizeof(buf);
-        write(STDOUT_FILENO, buf, n);
-        // column headers
-        for (int c = 0; c < vis_cols; ++c) {
-            char title[16];
-            snprintf(title, sizeof(title), " %c", col_name(col_off + c));
-            char cellbuf[64];
-            snprintf(cellbuf, sizeof(cellbuf), "%-*s", cell_w, title);
-            write(STDOUT_FILENO, cellbuf, strlen(cellbuf));
-        }
-        write(STDOUT_FILENO, "\r\n", 2);
-    }
-
-    // Grid
-    for (int r = 0; r < vis_rows; ++r) {
-        int rr = row_off + r;
-        // row label (right-aligned)
-        char rl[32];
-        snprintf(rl, sizeof(rl), "%*d ", left_w - 1 > 0 ? left_w - 1 : 0, rr + 1);
-        write(STDOUT_FILENO, rl, strlen(rl));
-        for (int c = 0; c < vis_cols; ++c) {
-            int cc = col_off + c;
-            Cell* cell = &sheet[rr][cc];
-            char out[128] = "";
-            if (cell->text[0] == '=') {
-                double v = eval_cell(rr, cc);
-                if (cell->err != ERR_NONE) {
-                    snprintf(out, sizeof(out), "#%s", err_name(cell->err));
-                } else {
-                    snprintf(out, sizeof(out), "%.10g", v);
-                }
-            } else if (cell->text[0] == '\0') {
-                out[0] = '\0';
-            } else {
-                // show literal text
-                snprintf(out, sizeof(out), "%s", cell->text);
-            }
-            // truncate display to cell_w
-            char disp[128];
-            int len = (int)strlen(out);
-            if (len > cell_w - 1) {
-                memcpy(disp, out, cell_w - 2);
-                disp[cell_w - 2] = '…';
-                disp[cell_w - 1] = '\0';
-            } else {
-                snprintf(disp, sizeof(disp), "%s", out);
-            }
-
-            if (rr == cur_row && cc == cur_col) write(STDOUT_FILENO, "\x1b[7m", 4);
-            char cellbuf[256];
-            snprintf(cellbuf, sizeof(cellbuf), "%-*s", cell_w, disp);
-            write(STDOUT_FILENO, cellbuf, strlen(cellbuf));
-            if (rr == cur_row && cc == cur_col) write(STDOUT_FILENO, "\x1b[0m", 4);
-        }
-        write(STDOUT_FILENO, "\r\n", 2);
-    }
-
-    // Fill remainder if terminal larger than sheet
-    for (int r = vis_rows; r < grid_h; ++r) {
-        for (int i = 0; i < screen_cols; ++i) write(STDOUT_FILENO, " ", 1);
-        write(STDOUT_FILENO, "\r\n", 2);
-    }
-
-    // Status bar (inverse)
-    {
-        char label[8]; cell_label(cur_row, cur_col, label);
-        Cell* cur = &sheet[cur_row][cur_col];
-        char valbuf[64] = "";
-        double v = 0.0;
-        int err = 0;
-        if (cur->text[0] == '=') {
-            clear_eval_flags();
-            v = eval_cell(cur_row, cur_col);
-            err = cur->err;
-            if (err == ERR_NONE) snprintf(valbuf, sizeof(valbuf), "val=%.10g", v);
-            else snprintf(valbuf, sizeof(valbuf), "err=%s", err_name(err));
-        } else if (cur->text[0] == '\0') {
-            snprintf(valbuf, sizeof(valbuf), "empty");
-        } else {
-            char* end = NULL;
-            v = strtod(cur->text, &end);
-            if (end && *end == '\0') snprintf(valbuf, sizeof(valbuf), "num=%.10g", v);
-            else snprintf(valbuf, sizeof(valbuf), "text");
-        }
-
-        char msg[1024];
-        snprintf(msg, sizeof(msg),
-                 "\x1b[7m %-4s raw:%s  %s  | arrows:move  Enter:edit  '=':formula  c:clear  s:save  l:load  g:goto  q:quit %-*s\x1b[0m",
-                 label,
-                 cur->text[0] ? cur->text : "(empty)",
-                 valbuf,
-                 screen_cols - 90 > 0 ? screen_cols - 90 : 1, "");
-
-        // Overwrite with transient status message if present
-        if (status_msg[0]) {
-            char smsg[1024];
-            snprintf(smsg, sizeof(smsg), "\x1b[7m %s %-*s\x1b[0m",
-                     status_msg,
-                     screen_cols - (int)strlen(status_msg) - 3 > 0 ? screen_cols - (int)strlen(status_msg) - 3 : 1,
-                     "");
-            write(STDOUT_FILENO, smsg, strlen(smsg));
-            status_msg[0] = '\0'; // show once
-        } else {
-            write(STDOUT_FILENO, msg, strlen(msg));
-        }
-    }
-
-    // place cursor at bottom-right-ish and show it
-    write(STDOUT_FILENO, "\x1b[?25h", 6);
-}
-
-static int prompt_line(const char* prompt, const char* initial, char* out, int outsz) {
-    // Minimal line editor on status line; ESC or Ctrl-G cancels, Enter accepts
-    int len = 0;
-    out[0] = '\0';
-    if (initial && *initial) {
-        strncpy(out, initial, outsz - 1);
-        out[outsz - 1] = '\0';
-        len = (int)strlen(out);
-    }
-    for (;;) {
-        // draw prompt on last line
-        get_window_size();
-        char buf[1024];
-        snprintf(buf, sizeof(buf), "\x1b[?25l\x1b[%d;1H\x1b[0m\x1b[2K%s%s\x1b[?25h",
-                 screen_rows, prompt, out);
-        write(STDOUT_FILENO, buf, strlen(buf));
-        int k = read_key();
-        if (k == KEY_ENTER) {
-            // clear prompt line
-            snprintf(buf, sizeof(buf), "\x1b[%d;1H\x1b[2K", screen_rows);
-            write(STDOUT_FILENO, buf, strlen(buf));
-            return 1;
-        }
-        if (k == 0x1b || k == KEY_CTRL_G) { // cancel
-            snprintf(buf, sizeof(buf), "\x1b[%d;1H\x1b[2K", screen_rows);
-            write(STDOUT_FILENO, buf, strlen(buf));
-            return 0;
-        }
-        if (k == KEY_BACKSPACE || k == 8) {
-            if (len > 0) { out[--len] = '\0'; }
-        } else if (k >= 32 && k < 127) {
-            if (len < outsz - 1) { out[len++] = (char)k; out[len] = '\0'; }
-        }
-    }
-}
-
-static void escape_write(FILE* f, const char* s) {
-    for (; *s; ++s) {
-        if (*s == '\\') fputs("\\\\", f);
-        else if (*s == '\n') fputs("\\n", f);
-        else if (*s == '\t') fputs("\\t", f);
-        else fputc(*s, f);
-    }
-}
-
-static void unescape_into(const char* s, char* out, int outsz) {
-    int i = 0;
-    while (*s && i < outsz - 1) {
-        if (*s == '\\') {
-            s++;
-            if (*s == 'n') { out[i++] = '\n'; s++; }
-            else if (*s == 't') { out[i++] = '\t'; s++; }
-            else if (*s == '\\') { out[i++] = '\\'; s++; }
-            else { out[i++] = '\\'; } // unknown, keep slash
-        } else {
-            out[i++] = *s++;
-        }
-    }
-    out[i] = '\0';
-}
-
-static int save_file(const char* path) {
-    FILE* f = fopen(path, "w");
-    if (!f) return -1;
-    // simple lines: r c text
-    for (int r = 0; r < MAX_ROWS; ++r) {
-        for (int c = 0; c < MAX_COLS; ++c) {
-            if (sheet[r][c].text[0]) {
-                fprintf(f, "%d %d ", r, c);
-                escape_write(f, sheet[r][c].text);
-                fputc('\n', f);
-            }
-        }
-    }
-    fclose(f);
-    return 0;
-}
-
-static int load_file(const char* path) {
-    FILE* f = fopen(path, "r");
-    if (!f) return -1;
-    // clear sheet
-    for (int r = 0; r < MAX_ROWS; ++r)
-        for (int c = 0; c < MAX_COLS; ++c)
-            sheet[r][c].text[0] = '\0';
-
-    char line[2048];
-    int count = 0;
-    while (fgets(line, sizeof(line), f)) {
-        char* p = line;
-        while (isspace((unsigned char)*p)) p++;
-        if (*p == '#' || *p == '\0') continue;
-        char* end;
-        long r = strtol(p, &end, 10);
-        if (end == p) continue;
-        p = end;
-        long c = strtol(p, &end, 10);
-        if (end == p) continue;
-        p = end;
-        while (*p == ' ' || *p == '\t') p++;
-        // strip trailing newline
-        char* nl = strchr(p, '\n'); if (nl) *nl = '\0';
-        if (r >= 0 && r < MAX_ROWS && c >= 0 && c < MAX_COLS) {
-            unescape_into(p, sheet[r][c].text, CELL_TEXT_LEN);
-            count++;
-        }
-    }
-    fclose(f);
-    return count;
-}
-
-static void edit_cell(bool start_with_equals) {
-    char label[8]; cell_label(cur_row, cur_col, label);
-    char prompt[64];
-    snprintf(prompt, sizeof(prompt), "Edit %s: ", label);
-    char buf[CELL_TEXT_LEN];
-    if (start_with_equals) {
-        snprintf(buf, sizeof(buf), "%s", "=");
-    } else {
-        snprintf(buf, sizeof(buf), "%s", sheet[cur_row][cur_col].text);
-    }
-    int ok = prompt_line(prompt, buf, buf, sizeof(buf));
-    if (ok) {
-        strncpy(sheet[cur_row][cur_col].text, buf, CELL_TEXT_LEN - 1);
-        sheet[cur_row][cur_col].text[CELL_TEXT_LEN - 1] = '\0';
-    }
-}
-
-static void clear_cell(void) {
-    sheet[cur_row][cur_col].text[0] = '\0';
-}
-
-static void goto_cell(void) {
-    char buf[32] = "";
-    if (prompt_line("Go to (e.g., B7): ", "", buf, sizeof(buf))) {
-        int r, c;
-        if (parse_cell_label(buf, &r, &c)) {
-            cur_row = r; cur_col = c;
-            statusf("Moved to %s", buf);
-        } else {
-            statusf("Invalid cell label");
-        }
-    }
-}
-
-int main(void) {
-    // Line-buffering off for smoother redraws
-    setvbuf(stdout, NULL, _IOFBF, 0);
-    enable_raw_mode();
-    signal(SIGWINCH, handle_sigwinch);
-    get_window_size();
-
-    // Main loop
-    for (;;) {
-        draw_screen();
-        int k = read_key();
-        if (k == 'q') break;
-        else if (k == KEY_ARROW_UP)    cur_row = clampi(cur_row - 1, 0, MAX_ROWS - 1);
-        else if (k == KEY_ARROW_DOWN)  cur_row = clampi(cur_row + 1, 0, MAX_ROWS - 1);
-        else if (k == KEY_ARROW_LEFT)  cur_col = clampi(cur_col - 1, 0, MAX_COLS - 1);
-        else if (k == KEY_ARROW_RIGHT) cur_col = clampi(cur_col + 1, 0, MAX_COLS - 1);
-        else if (k == KEY_HOME)        cur_col = 0;
-        else if (k == KEY_END)         cur_col = MAX_COLS - 1;
-        else if (k == KEY_PAGE_UP)     cur_row = clampi(cur_row - 10, 0, MAX_ROWS - 1);
-        else if (k == KEY_PAGE_DOWN)   cur_row = clampi(cur_row + 10, 0, MAX_ROWS - 1);
-        else if (k == '\t')            cur_col = clampi(cur_col + 1, 0, MAX_COLS - 1);
-        else if (k == KEY_SHIFT_TAB)   cur_col = clampi(cur_col - 1, 0, MAX_COLS - 1);
-        else if (k == KEY_ENTER || k == 'e') { edit_cell(false); }
-        else if (k == '=') { edit_cell(true); }
-        else if (k == 'c') { clear_cell(); }
-        else if (k == 'g') { goto_cell(); }
-        else if (k == 's') {
-            char buf[256];
-            if (last_file[0]) snprintf(buf, sizeof(buf), "%s", last_file);
-            else buf[0] = '\0';
-            if (prompt_line("Save file: ", buf, buf, sizeof(buf))) {
-                if (save_file(buf) == 0) {
-                    snprintf(last_file, sizeof(last_file), "%s", buf);
-                    statusf("Saved: %s", buf);
-                } else {
-                    statusf("Save failed: %s", strerror(errno));
-                }
-            }
-        }
-        else if (k == 'l') {
-            char buf[256];
-            if (last_file[0]) snprintf(buf, sizeof(buf), "%s", last_file);
-            else buf[0] = '\0';
-            if (prompt_line("Load file: ", buf, buf, sizeof(buf))) {
-                int n = load_file(buf);
-                if (n >= 0) {
-                    snprintf(last_file, sizeof(last_file), "%s", buf);
-                    statusf("Loaded %d cells from %s", n, buf);
-                } else {
-                    statusf("Load failed: %s", strerror(errno));
-                }
-            }
-        }
-        else if (k == KEY_CTRL_C) {
+    while (running) {
+        // Core loop: update, draw, get input
+        updateAllCells();
+        clearScreen();
+        drawGrid();
+        
+        // Get user input and check if we should quit
+        printf("Enter command or expression for %c%d: %s\n> ", 
+               'A' + currentCol, currentRow + 1, grid[currentRow][currentCol].expression);
+        
+        char input[INPUT_BUFFER_SIZE];
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            // EOF or error, quit gracefully
             break;
         }
+
+        // Remove trailing newline
+        input[strcspn(input, "\n")] = 0;
+
+        if (strcmp(input, "q") == 0 || strcmp(input, "quit") == 0) {
+            running = 0;
+        } else {
+            handleInput(input);
+        }
     }
 
+    clearScreen();
+    printf("Exiting tcalc. Goodbye!\n");
     return 0;
+}
+
+// --- Initialization ---
+void initializeGrid() {
+    for (int r = 0; r < ROWS; ++r) {
+        for (int c = 0; c < COLS; ++c) {
+            strcpy(grid[r][c].expression, "");
+            strcpy(grid[r][c].display, "");
+            grid[r][c].value = 0.0;
+            grid[r][c].error = NO_ERROR;
+            grid[r][c].needs_recalc = 1; // Mark all for initial calculation
+        }
+    }
+}
+
+// --- Screen and Drawing ---
+void clearScreen() {
+    // Basic ANSI escape codes to clear screen and move cursor to top-left
+    printf("\033[H\033[J");
+}
+
+void drawGrid() {
+    // Print header
+    printf("tcalc - A Simple Terminal Spreadsheet\n");
+    printf("Use w/a/s/d to navigate, q to quit.\n\n");
+    
+    // Print column letters
+    printf("%*s", CELL_WIDTH, "");
+    for (int c = 0; c < COLS; ++c) {
+        printf("|%*c%*s", CELL_WIDTH/2, 'A' + c, (CELL_WIDTH-1)/2, "");
+    }
+    printf("|\n");
+
+    // Print separator line
+    printf("%*s", CELL_WIDTH, "");
+    for (int c = 0; c < COLS; ++c) {
+        printf("+");
+        for(int i=0; i<CELL_WIDTH; ++i) printf("-");
+    }
+    printf("+\n");
+
+    // Print rows
+    for (int r = 0; r < ROWS; ++r) {
+        // Print row number
+        printf("%*d ", CELL_WIDTH - 2, r + 1);
+
+        // Print cell contents
+        for (int c = 0; c < COLS; ++c) {
+            char cell_content[CELL_WIDTH + 1];
+
+            // Truncate display string if it's too long
+            strncpy(cell_content, grid[r][c].display, CELL_WIDTH);
+            cell_content[CELL_WIDTH] = '\0';
+            
+            // Highlight current cell
+            if (r == currentRow && c == currentCol) {
+                printf("|[%-*s]", CELL_WIDTH - 2, cell_content);
+            } else {
+                printf("| %-*s ", CELL_WIDTH - 2, cell_content);
+            }
+        }
+        printf("|\n");
+    }
+}
+
+// --- Input Handling ---
+void handleInput(const char* input) {
+    if (strlen(input) == 1) { // Check for navigation commands
+        switch (input[0]) {
+            case 'w': if (currentRow > 0) currentRow--; return;
+            case 's': if (currentRow < ROWS - 1) currentRow++; return;
+            case 'a': if (currentCol > 0) currentCol--; return;
+            case 'd': if (currentCol < COLS - 1) currentCol++; return;
+        }
+    }
+
+    // If not a navigation command, it's an expression for the current cell
+    strncpy(grid[currentRow][currentCol].expression, input, MAX_EXPR_LEN);
+    grid[currentRow][currentCol].expression[MAX_EXPR_LEN] = '\0';
+
+    // Mark all cells for recalculation. A more optimized approach would use
+    // a dependency graph, but this is simpler and sufficient for this scale.
+    for (int r = 0; r < ROWS; ++r) {
+        for (int c = 0; c < COLS; ++c) {
+            grid[r][c].needs_recalc = 1;
+        }
+    }
+}
+
+
+// --- Calculation Engine ---
+
+// Recalculates all cells that are marked as needing it
+void updateAllCells() {
+    for (int r = 0; r < ROWS; ++r) {
+        for (int c = 0; c < COLS; ++c) {
+            if (grid[r][c].needs_recalc) {
+                // Clear the evaluation path for this top-level calculation
+                memset(evaluation_path, 0, sizeof(evaluation_path));
+                evaluateCell(r, c);
+            }
+        }
+    }
+}
+
+// Evaluates a single cell and updates its display and value
+void evaluateCell(int r, int c) {
+    Cell* cell = &grid[r][c];
+    cell->error = NO_ERROR;
+    
+    if (cell->expression[0] == '\0') {
+        // Empty cell
+        strcpy(cell->display, "");
+        cell->value = 0.0;
+    } else if (cell->expression[0] == '=') {
+        // Formula
+        int error_code = NO_ERROR;
+        // Mark this cell as being part of the current evaluation path
+        evaluation_path[r][c] = 1;
+        cell->value = parseExpression(cell->expression + 1, &error_code);
+        // Unmark it after evaluation
+        evaluation_path[r][c] = 0;
+        
+        cell->error = error_code;
+        if (error_code == NO_ERROR) {
+            snprintf(cell->display, CELL_WIDTH + 1, "%.2f", cell->value);
+        } else {
+            // Set display to error message
+            switch(error_code) {
+                case ERROR_SYNTAX: strncpy(cell->display, "#SYNTAX!", CELL_WIDTH); break;
+                case ERROR_CIRCULAR_REFERENCE: strncpy(cell->display, "#REF!", CELL_WIDTH); break;
+                case ERROR_DIV_BY_ZERO: strncpy(cell->display, "#DIV/0!", CELL_WIDTH); break;
+                case ERROR_VALUE: strncpy(cell->display, "#VALUE!", CELL_WIDTH); break;
+                default: strncpy(cell->display, "#ERROR!", CELL_WIDTH); break;
+            }
+        }
+
+    } else {
+        // Literal (text or number)
+        char* endptr;
+        double val = strtod(cell->expression, &endptr);
+        if (*endptr == '\0' || isspace(*endptr)) {
+            // It's a number
+            cell->value = val;
+            snprintf(cell->display, CELL_WIDTH + 1, "%.2f", cell->value);
+        } else {
+            // It's text
+            cell->value = 0.0; // Text cells have a numeric value of 0
+            cell->error = ERROR_VALUE; // Not an error to display, but an error if used in math
+            strncpy(cell->display, cell->expression, CELL_WIDTH);
+        }
+    }
+    cell->display[CELL_WIDTH] = '\0'; // Ensure null-termination
+    cell->needs_recalc = 0; // This cell is now up-to-date
+}
+
+// A very simple parser for "operand operator operand" format
+double parseExpression(const char* expr, int* error_code) {
+    char operand1_str[MAX_EXPR_LEN];
+    char operand2_str[MAX_EXPR_LEN];
+    char op;
+    double operand1_val, operand2_val;
+
+    const char* p = expr;
+    int i = 0;
+    
+    // Skip leading whitespace
+    while (*p && isspace(*p)) p++;
+
+    // Parse operand 1
+    while (*p && !strchr("+-*/", *p)) {
+        if (!isspace(*p)) operand1_str[i++] = *p;
+        p++;
+    }
+    operand1_str[i] = '\0';
+    if (strlen(operand1_str) == 0) { *error_code = ERROR_SYNTAX; return 0; }
+
+    // Parse operator
+    while (*p && isspace(*p)) p++;
+    if (!*p) { // Only one operand, treat it as a value
+        op = 0; 
+    } else {
+        op = *p;
+        p++;
+    }
+
+    if(op == 0) { // Single operand case (e.g., "=A1" or "=123")
+        i = 0;
+        operand2_str[0] = '\0';
+    } else { // Two operands case
+        // Parse operand 2
+        while (*p && isspace(*p)) p++;
+        i = 0;
+        while (*p) {
+            if (!isspace(*p)) operand2_str[i++] = *p;
+            p++;
+        }
+        operand2_str[i] = '\0';
+        if (strlen(operand2_str) == 0) { *error_code = ERROR_SYNTAX; return 0; }
+    }
+
+
+    // Evaluate operand 1
+    if (isalpha(operand1_str[0])) { // Cell reference
+        int c = toupper(operand1_str[0]) - 'A';
+        int r = atoi(operand1_str + 1) - 1;
+        operand1_val = getCellValue(r, c, error_code);
+        if (*error_code != NO_ERROR) return 0;
+    } else { // Number literal
+        char* endptr;
+        operand1_val = strtod(operand1_str, &endptr);
+        if (*endptr != '\0') { *error_code = ERROR_SYNTAX; return 0; }
+    }
+    
+    // If there's no second operand, just return the first
+    if(op == 0) return operand1_val;
+
+    // Evaluate operand 2
+    if (isalpha(operand2_str[0])) { // Cell reference
+        int c = toupper(operand2_str[0]) - 'A';
+        int r = atoi(operand2_str + 1) - 1;
+        operand2_val = getCellValue(r, c, error_code);
+        if (*error_code != NO_ERROR) return 0;
+    } else { // Number literal
+        char* endptr;
+        operand2_val = strtod(operand2_str, &endptr);
+        if (*endptr != '\0') { *error_code = ERROR_SYNTAX; return 0; }
+    }
+
+    // Perform operation
+    switch (op) {
+        case '+': return operand1_val + operand2_val;
+        case '-': return operand1_val - operand2_val;
+        case '*': return operand1_val * operand2_val;
+        case '/':
+            if (fabs(operand2_val) < 1e-9) {
+                *error_code = ERROR_DIV_BY_ZERO;
+                return 0;
+            }
+            return operand1_val / operand2_val;
+        default:
+            *error_code = ERROR_SYNTAX;
+            return 0;
+    }
+}
+
+// Safely gets the value of another cell, handling errors and recursion
+double getCellValue(int r, int c, int* error_code) {
+    // Bounds check
+    if (r < 0 || r >= ROWS || c < 0 || c >= COLS) {
+        *error_code = ERROR_SYNTAX; // Bad reference
+        return 0;
+    }
+
+    // Circular reference check
+    if (evaluation_path[r][c]) {
+        *error_code = ERROR_CIRCULAR_REFERENCE;
+        return 0;
+    }
+
+    // If the referenced cell has not been calculated in this pass, calculate it now
+    if (grid[r][c].needs_recalc) {
+        evaluateCell(r, c);
+    }
+    
+    // Propagate errors from the referenced cell
+    if (grid[r][c].error != NO_ERROR && grid[r][c].error != ERROR_VALUE) {
+        *error_code = grid[r][c].error;
+        return 0;
+    }
+    if (grid[r][c].error == ERROR_VALUE) { // Trying to use a text cell in math
+        *error_code = ERROR_VALUE;
+        return 0;
+    }
+
+
+    return grid[r][c].value;
 }
