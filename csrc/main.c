@@ -1,386 +1,357 @@
 /******************************************************************************
- * tcalc.c - A Simple Terminal-Based Spreadsheet Program
- *
- * Author: A helpful AI assistant
- * Date: 2023
- *
- * A single-file, dependency-free C program that mimics the basic
- * functionality of early spreadsheet software like VisiCalc in the terminal.
+ * Simple-Sheet: A bare-bones, single-file spreadsheet program in C.
  *
  * Features:
- * - A grid of cells with addresses (A1, B2, etc.).
- * - Navigation with 'w', 'a', 's', 'd'.
- * - Data entry for text, numbers, and formulas.
- * - Formulas start with '=' and support one binary operator (+, -, *, /).
- *   Examples: =A1+B2, =C1*10, =50/2
- * - Automatic recalculation of all cells.
- * - Circular dependency detection.
- * - Error reporting for syntax, value, division by zero, and circular refs.
- * - Quit with 'q' or 'quit'.
+ * - 10x10 grid (A-J, 0-9)
+ * - Cells hold integers or formulas.
+ * - Formulas support: +, -, *, /
+ * - Formula support: SUM(range), e.g., SUM(A0:A9)
+ * - Automatic recalculation on every edit.
+ * - No external dependencies.
  *
- * Compilation:
- *   gcc -o tcalc tcalc.c -lm
- *
- * Usage:
- *   ./tcalc
- *
- *****************************************************************************/
+ * Author: A helpful AI
+ * Compile: gcc -o spreadsheet spreadsheet.c
+ * Run: ./spreadsheet
+ ******************************************************************************/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <math.h>
 
 // --- Configuration ---
-#define COLS 8
-#define ROWS 15
-#define CELL_WIDTH 10
-#define INPUT_BUFFER_SIZE 256
-#define MAX_EXPR_LEN (INPUT_BUFFER_SIZE - 1)
+#define ROWS 10
+#define COLS 10
+#define MAX_CELL_TEXT 256
+#define MAX_INPUT_BUFFER 512
+#define RECALC_PASSES 10 // How many times to iterate to resolve dependencies
 
-// --- Error Types ---
-#define NO_ERROR 0
-#define ERROR_SYNTAX 1
-#define ERROR_CIRCULAR_REFERENCE 2
-#_define ERROR_BAD_REFERENCE 3 // Currently folded into SYNTAX
-#define ERROR_DIV_BY_ZERO 4
-#define ERROR_VALUE 5 // e.g., trying to do math on text
+// --- Data Structures ---
 
-// --- Cell Structure ---
-typedef struct Cell {
-    char expression[MAX_EXPR_LEN + 1]; // What the user typed, e.g., "=A1+B2"
-    char display[CELL_WIDTH + 1];      // What is shown in the grid
-    double value;                      // The numeric value if it's a number/formula
-    int error;                         // Error state of the cell
-    int needs_recalc;                  // Flag to trigger recalculation
+// Represents a single cell in the spreadsheet
+typedef struct {
+    char text[MAX_CELL_TEXT]; // The raw text entered by the user (e.g., "123", "=A0+B0")
+    int value;                // The calculated numeric value of the cell
+    int is_formula;           // Flag: 1 if the cell contains a formula, 0 otherwise
+    int error;                // Flag for errors like #DIV/0! or #REF!
 } Cell;
 
-// --- Global State ---
+// The global grid for our spreadsheet
 Cell grid[ROWS][COLS];
-int currentRow = 0;
-int currentCol = 0;
-// For circular reference detection during a single evaluation pass
-int evaluation_path[ROWS][COLS];
 
-// --- Forward Declarations ---
-void initializeGrid();
-void clearScreen();
-void drawGrid();
-void handleInput();
-void updateAllCells();
-void evaluateCell(int r, int c);
-double parseExpression(const char* expr, int* error_code);
-double getCellValue(int r, int c, int* error_code);
+// --- Function Prototypes ---
 
-// --- Main Program Loop ---
+// Core Logic
+void init_grid();
+void cleanup();
+void recalculate_all();
+int evaluate_expression(const char* expr);
+
+// User Interaction & Display
+void display_grid();
+void process_input(char* input);
+void print_help();
+
+// Helper/Utility Functions
+int parse_cell_ref(const char* ref, int* row, int* col);
+int get_cell_value_by_ref(const char* ref);
+void trim_whitespace(char* str);
+
+// --- Main Function ---
+
 int main() {
-    initializeGrid();
-    int running = 1;
+    char input_buffer[MAX_INPUT_BUFFER];
 
-    while (running) {
-        // Core loop: update, draw, get input
-        updateAllCells();
-        clearScreen();
-        drawGrid();
+    init_grid();
+    print_help();
+
+    while (1) {
+        display_grid();
+        printf("> ");
         
-        // Get user input and check if we should quit
-        printf("Enter command or expression for %c%d: %s\n> ", 
-               'A' + currentCol, currentRow + 1, grid[currentRow][currentCol].expression);
-        
-        char input[INPUT_BUFFER_SIZE];
-        if (fgets(input, sizeof(input), stdin) == NULL) {
-            // EOF or error, quit gracefully
-            break;
+        if (fgets(input_buffer, sizeof(input_buffer), stdin) == NULL) {
+            break; // End on EOF
         }
 
-        // Remove trailing newline
-        input[strcspn(input, "\n")] = 0;
+        trim_whitespace(input_buffer);
 
-        if (strcmp(input, "q") == 0 || strcmp(input, "quit") == 0) {
-            running = 0;
-        } else {
-            handleInput(input);
+        if (strcmp(input_buffer, "quit") == 0 || strcmp(input_buffer, "exit") == 0) {
+            break;
+        } else if (strcmp(input_buffer, "help") == 0) {
+            print_help();
+        } else if (strlen(input_buffer) > 0) {
+            process_input(input_buffer);
+            recalculate_all();
         }
     }
-
-    clearScreen();
-    printf("Exiting tcalc. Goodbye!\n");
+    
+    cleanup();
+    printf("Exiting Simple-Sheet. Goodbye!\n");
     return 0;
 }
 
-// --- Initialization ---
-void initializeGrid() {
-    for (int r = 0; r < ROWS; ++r) {
-        for (int c = 0; c < COLS; ++c) {
-            strcpy(grid[r][c].expression, "");
-            strcpy(grid[r][c].display, "");
-            grid[r][c].value = 0.0;
-            grid[r][c].error = NO_ERROR;
-            grid[r][c].needs_recalc = 1; // Mark all for initial calculation
+
+// --- Core Logic Implementation ---
+
+/**
+ * @brief Initializes the grid, setting all cells to a default empty state.
+ */
+void init_grid() {
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            strcpy(grid[r][c].text, "");
+            grid[r][c].value = 0;
+            grid[r][c].is_formula = 0;
+            grid[r][c].error = 0;
         }
     }
 }
 
-// --- Screen and Drawing ---
-void clearScreen() {
-    // Basic ANSI escape codes to clear screen and move cursor to top-left
-    printf("\033[H\033[J");
+/**
+ * @brief Frees any resources allocated during runtime. (Currently none, but good practice).
+ */
+void cleanup() {
+    // In a version with dynamic memory (e.g., malloc'd strings),
+    // this function would free that memory.
 }
 
-void drawGrid() {
-    // Print header
-    printf("tcalc - A Simple Terminal Spreadsheet\n");
-    printf("Use w/a/s/d to navigate, q to quit.\n\n");
-    
-    // Print column letters
-    printf("%*s", CELL_WIDTH, "");
-    for (int c = 0; c < COLS; ++c) {
-        printf("|%*c%*s", CELL_WIDTH/2, 'A' + c, (CELL_WIDTH-1)/2, "");
+/**
+ * @brief Recalculates the values of all formula cells in the grid.
+ * It iterates multiple times to allow for dependency chains (e.g., C1=B1, B1=A1).
+ */
+void recalculate_all() {
+    for (int pass = 0; pass < RECALC_PASSES; pass++) {
+        for (int r = 0; r < ROWS; r++) {
+            for (int c = 0; c < COLS; c++) {
+                if (grid[r][c].is_formula) {
+                    grid[r][c].value = evaluate_expression(grid[r][c].text);
+                }
+            }
+        }
     }
-    printf("|\n");
+}
 
-    // Print separator line
-    printf("%*s", CELL_WIDTH, "");
-    for (int c = 0; c < COLS; ++c) {
-        printf("+");
-        for(int i=0; i<CELL_WIDTH; ++i) printf("-");
+/**
+ * @brief Parses and evaluates a formula expression from a cell's text.
+ * @param expr The expression string, starting with '='.
+ * @return The calculated integer value.
+ */
+int evaluate_expression(const char* expr) {
+    // Skip the leading '='
+    const char* p = expr + 1;
+    char term1_str[MAX_CELL_TEXT], term2_str[MAX_CELL_TEXT];
+    char op = 0;
+    int val1, val2;
+
+    // --- Check for SUM(A0:B9) function ---
+    if (strncmp(p, "SUM(", 4) == 0) {
+        char start_ref_str[16], end_ref_str[16];
+        if (sscanf(p, "SUM(%[^:]:%[^)])", start_ref_str, end_ref_str) == 2) {
+            int start_r, start_c, end_r, end_c;
+            if (parse_cell_ref(start_ref_str, &start_r, &start_c) && parse_cell_ref(end_ref_str, &end_r, &end_c)) {
+                int sum = 0;
+                // Ensure the loop range is valid
+                int r_min = (start_r < end_r) ? start_r : end_r;
+                int r_max = (start_r > end_r) ? start_r : end_r;
+                int c_min = (start_c < end_c) ? start_c : end_c;
+                int c_max = (start_c > end_c) ? start_c : end_c;
+
+                for (int r = r_min; r <= r_max; r++) {
+                    for (int c = c_min; c <= c_max; c++) {
+                        sum += grid[r][c].value;
+                    }
+                }
+                return sum;
+            }
+        }
+        return 0; // #REF! error if parsing fails
     }
-    printf("+\n");
+
+    // --- Check for simple arithmetic: operand operator operand ---
+    const char* op_ptr = strpbrk(p, "+-*/");
+
+    if (op_ptr) {
+        op = *op_ptr;
+        
+        // Copy term1
+        strncpy(term1_str, p, op_ptr - p);
+        term1_str[op_ptr - p] = '\0';
+        trim_whitespace(term1_str);
+        
+        // Copy term2
+        strcpy(term2_str, op_ptr + 1);
+        trim_whitespace(term2_str);
+
+        val1 = get_cell_value_by_ref(term1_str);
+        val2 = get_cell_value_by_ref(term2_str);
+        
+        switch (op) {
+            case '+': return val1 + val2;
+            case '-': return val1 - val2;
+            case '*': return val1 * val2;
+            case '/': 
+                if (val2 == 0) return 0; // #DIV/0! error state
+                return val1 / val2;
+        }
+    }
+    
+    // --- If no operator, it's a single reference or a constant ---
+    return get_cell_value_by_ref(p);
+}
+
+
+// --- User Interaction & Display Implementation ---
+
+/**
+ * @brief Displays the current state of the grid to the console.
+ */
+void display_grid() {
+    printf("\n");
+    // Print column headers
+    printf("      ");
+    for (int c = 0; c < COLS; c++) {
+        printf("%-8c", 'A' + c);
+    }
+    printf("\n------");
+    for (int c = 0; c < COLS; c++) {
+        printf("---------");
+    }
+    printf("\n");
 
     // Print rows
-    for (int r = 0; r < ROWS; ++r) {
-        // Print row number
-        printf("%*d ", CELL_WIDTH - 2, r + 1);
-
-        // Print cell contents
-        for (int c = 0; c < COLS; ++c) {
-            char cell_content[CELL_WIDTH + 1];
-
-            // Truncate display string if it's too long
-            strncpy(cell_content, grid[r][c].display, CELL_WIDTH);
-            cell_content[CELL_WIDTH] = '\0';
-            
-            // Highlight current cell
-            if (r == currentRow && c == currentCol) {
-                printf("|[%-*s]", CELL_WIDTH - 2, cell_content);
+    for (int r = 0; r < ROWS; r++) {
+        printf("%-5d|", r);
+        for (int c = 0; c < COLS; c++) {
+            // If cell contains text that isn't a simple number or formula, show "TEXT"
+            if (!grid[r][c].is_formula && isalpha(grid[r][c].text[0])) {
+                 printf("%-8s", "TEXT");
             } else {
-                printf("| %-*s ", CELL_WIDTH - 2, cell_content);
+                 printf("%-8d", grid[r][c].value);
             }
         }
-        printf("|\n");
+        printf("\n");
     }
+    printf("\n");
 }
 
-// --- Input Handling ---
-void handleInput(const char* input) {
-    if (strlen(input) == 1) { // Check for navigation commands
-        switch (input[0]) {
-            case 'w': if (currentRow > 0) currentRow--; return;
-            case 's': if (currentRow < ROWS - 1) currentRow++; return;
-            case 'a': if (currentCol > 0) currentCol--; return;
-            case 'd': if (currentCol < COLS - 1) currentCol++; return;
-        }
-    }
-
-    // If not a navigation command, it's an expression for the current cell
-    strncpy(grid[currentRow][currentCol].expression, input, MAX_EXPR_LEN);
-    grid[currentRow][currentCol].expression[MAX_EXPR_LEN] = '\0';
-
-    // Mark all cells for recalculation. A more optimized approach would use
-    // a dependency graph, but this is simpler and sufficient for this scale.
-    for (int r = 0; r < ROWS; ++r) {
-        for (int c = 0; c < COLS; ++c) {
-            grid[r][c].needs_recalc = 1;
-        }
-    }
-}
-
-
-// --- Calculation Engine ---
-
-// Recalculates all cells that are marked as needing it
-void updateAllCells() {
-    for (int r = 0; r < ROWS; ++r) {
-        for (int c = 0; c < COLS; ++c) {
-            if (grid[r][c].needs_recalc) {
-                // Clear the evaluation path for this top-level calculation
-                memset(evaluation_path, 0, sizeof(evaluation_path));
-                evaluateCell(r, c);
-            }
-        }
-    }
-}
-
-// Evaluates a single cell and updates its display and value
-void evaluateCell(int r, int c) {
-    Cell* cell = &grid[r][c];
-    cell->error = NO_ERROR;
+/**
+ * @brief Processes a line of user input, e.g., "A1 = 123" or "B2 = A0 + A1".
+ * @param input The raw input string from the user.
+ */
+void process_input(char* input) {
+    char cell_ref_str[16];
+    char* expression_str;
     
-    if (cell->expression[0] == '\0') {
-        // Empty cell
-        strcpy(cell->display, "");
-        cell->value = 0.0;
-    } else if (cell->expression[0] == '=') {
-        // Formula
-        int error_code = NO_ERROR;
-        // Mark this cell as being part of the current evaluation path
-        evaluation_path[r][c] = 1;
-        cell->value = parseExpression(cell->expression + 1, &error_code);
-        // Unmark it after evaluation
-        evaluation_path[r][c] = 0;
-        
-        cell->error = error_code;
-        if (error_code == NO_ERROR) {
-            snprintf(cell->display, CELL_WIDTH + 1, "%.2f", cell->value);
-        } else {
-            // Set display to error message
-            switch(error_code) {
-                case ERROR_SYNTAX: strncpy(cell->display, "#SYNTAX!", CELL_WIDTH); break;
-                case ERROR_CIRCULAR_REFERENCE: strncpy(cell->display, "#REF!", CELL_WIDTH); break;
-                case ERROR_DIV_BY_ZERO: strncpy(cell->display, "#DIV/0!", CELL_WIDTH); break;
-                case ERROR_VALUE: strncpy(cell->display, "#VALUE!", CELL_WIDTH); break;
-                default: strncpy(cell->display, "#ERROR!", CELL_WIDTH); break;
-            }
-        }
+    char* equals_ptr = strchr(input, '=');
+    if (equals_ptr == NULL) {
+        printf("ERROR: Invalid format. Use 'CELL = value/formula'. Example: A1 = 100\n");
+        return;
+    }
 
+    // Isolate the cell reference part
+    *equals_ptr = '\0'; // Temporarily terminate the string at '='
+    strcpy(cell_ref_str, input);
+    trim_whitespace(cell_ref_str);
+    
+    // The rest of the string is the expression
+    expression_str = equals_ptr + 1;
+    trim_whitespace(expression_str);
+
+    int r, c;
+    if (!parse_cell_ref(cell_ref_str, &r, &c)) {
+        printf("ERROR: Invalid cell reference '%s'. Use A-J and 0-9.\n", cell_ref_str);
+        return;
+    }
+
+    // Store the raw text in the cell
+    strncpy(grid[r][c].text, expression_str, MAX_CELL_TEXT - 1);
+    grid[r][c].text[MAX_CELL_TEXT-1] = '\0';
+
+    // Check if it's a formula or a direct value
+    if (expression_str[0] == '=') {
+        grid[r][c].is_formula = 1;
+        // The value will be calculated by recalculate_all()
     } else {
-        // Literal (text or number)
-        char* endptr;
-        double val = strtod(cell->expression, &endptr);
-        if (*endptr == '\0' || isspace(*endptr)) {
-            // It's a number
-            cell->value = val;
-            snprintf(cell->display, CELL_WIDTH + 1, "%.2f", cell->value);
-        } else {
-            // It's text
-            cell->value = 0.0; // Text cells have a numeric value of 0
-            cell->error = ERROR_VALUE; // Not an error to display, but an error if used in math
-            strncpy(cell->display, cell->expression, CELL_WIDTH);
-        }
-    }
-    cell->display[CELL_WIDTH] = '\0'; // Ensure null-termination
-    cell->needs_recalc = 0; // This cell is now up-to-date
-}
-
-// A very simple parser for "operand operator operand" format
-double parseExpression(const char* expr, int* error_code) {
-    char operand1_str[MAX_EXPR_LEN];
-    char operand2_str[MAX_EXPR_LEN];
-    char op;
-    double operand1_val, operand2_val;
-
-    const char* p = expr;
-    int i = 0;
-    
-    // Skip leading whitespace
-    while (*p && isspace(*p)) p++;
-
-    // Parse operand 1
-    while (*p && !strchr("+-*/", *p)) {
-        if (!isspace(*p)) operand1_str[i++] = *p;
-        p++;
-    }
-    operand1_str[i] = '\0';
-    if (strlen(operand1_str) == 0) { *error_code = ERROR_SYNTAX; return 0; }
-
-    // Parse operator
-    while (*p && isspace(*p)) p++;
-    if (!*p) { // Only one operand, treat it as a value
-        op = 0; 
-    } else {
-        op = *p;
-        p++;
-    }
-
-    if(op == 0) { // Single operand case (e.g., "=A1" or "=123")
-        i = 0;
-        operand2_str[0] = '\0';
-    } else { // Two operands case
-        // Parse operand 2
-        while (*p && isspace(*p)) p++;
-        i = 0;
-        while (*p) {
-            if (!isspace(*p)) operand2_str[i++] = *p;
-            p++;
-        }
-        operand2_str[i] = '\0';
-        if (strlen(operand2_str) == 0) { *error_code = ERROR_SYNTAX; return 0; }
-    }
-
-
-    // Evaluate operand 1
-    if (isalpha(operand1_str[0])) { // Cell reference
-        int c = toupper(operand1_str[0]) - 'A';
-        int r = atoi(operand1_str + 1) - 1;
-        operand1_val = getCellValue(r, c, error_code);
-        if (*error_code != NO_ERROR) return 0;
-    } else { // Number literal
-        char* endptr;
-        operand1_val = strtod(operand1_str, &endptr);
-        if (*endptr != '\0') { *error_code = ERROR_SYNTAX; return 0; }
-    }
-    
-    // If there's no second operand, just return the first
-    if(op == 0) return operand1_val;
-
-    // Evaluate operand 2
-    if (isalpha(operand2_str[0])) { // Cell reference
-        int c = toupper(operand2_str[0]) - 'A';
-        int r = atoi(operand2_str + 1) - 1;
-        operand2_val = getCellValue(r, c, error_code);
-        if (*error_code != NO_ERROR) return 0;
-    } else { // Number literal
-        char* endptr;
-        operand2_val = strtod(operand2_str, &endptr);
-        if (*endptr != '\0') { *error_code = ERROR_SYNTAX; return 0; }
-    }
-
-    // Perform operation
-    switch (op) {
-        case '+': return operand1_val + operand2_val;
-        case '-': return operand1_val - operand2_val;
-        case '*': return operand1_val * operand2_val;
-        case '/':
-            if (fabs(operand2_val) < 1e-9) {
-                *error_code = ERROR_DIV_BY_ZERO;
-                return 0;
-            }
-            return operand1_val / operand2_val;
-        default:
-            *error_code = ERROR_SYNTAX;
-            return 0;
+        grid[r][c].is_formula = 0;
+        // If not a formula, its value is just its integer conversion
+        grid[r][c].value = atoi(expression_str);
     }
 }
 
-// Safely gets the value of another cell, handling errors and recursion
-double getCellValue(int r, int c, int* error_code) {
-    // Bounds check
-    if (r < 0 || r >= ROWS || c < 0 || c >= COLS) {
-        *error_code = ERROR_SYNTAX; // Bad reference
-        return 0;
-    }
+/**
+ * @brief Prints the help message with instructions.
+ */
+void print_help() {
+    printf("\n--- Simple-Sheet Help ---\n");
+    printf("Commands:\n");
+    printf("  CELL = value       Set a numeric value (e.g., A1 = 123)\n");
+    printf("  CELL = \"text\"    Set a text value (e.g., B2 = \"hello\")\n");
+    printf("  CELL = formula     Set a formula (e.g., C3 = A1+B1)\n");
+    printf("  Formulas start with '='.\n");
+    printf("  Supported operators: +, -, *, /\n");
+    printf("  Supported functions: SUM(range), e.g., D4 = SUM(A0:C0)\n");
+    printf("\n");
+    printf("  help               Show this help message\n");
+    printf("  quit or exit       Exit the program\n");
+    printf("-------------------------\n");
+}
 
-    // Circular reference check
-    if (evaluation_path[r][c]) {
-        *error_code = ERROR_CIRCULAR_REFERENCE;
-        return 0;
-    }
 
-    // If the referenced cell has not been calculated in this pass, calculate it now
-    if (grid[r][c].needs_recalc) {
-        evaluateCell(r, c);
-    }
+// --- Helper/Utility Function Implementation ---
+
+/**
+ * @brief Parses a cell reference string like "A1" or "J9" into row/col indices.
+ * @param ref The string to parse.
+ * @param row Pointer to store the resulting row index.
+ * @param col Pointer to store the resulting column index.
+ * @return 1 on success, 0 on failure (invalid format or out of bounds).
+ */
+int parse_cell_ref(const char* ref, int* row, int* col) {
+    if (ref == NULL || strlen(ref) < 2) return 0;
     
-    // Propagate errors from the referenced cell
-    if (grid[r][c].error != NO_ERROR && grid[r][c].error != ERROR_VALUE) {
-        *error_code = grid[r][c].error;
-        return 0;
-    }
-    if (grid[r][c].error == ERROR_VALUE) { // Trying to use a text cell in math
-        *error_code = ERROR_VALUE;
-        return 0;
-    }
+    char c_ref = toupper(ref[0]);
+    int r_ref = atoi(&ref[1]);
 
+    if (c_ref < 'A' || c_ref > ('A' + COLS - 1)) return 0;
+    if (r_ref < 0 || r_ref >= ROWS) return 0;
+    
+    *col = c_ref - 'A';
+    *row = r_ref;
+    
+    return 1;
+}
 
-    return grid[r][c].value;
+/**
+ * @brief Gets the value of an operand, which could be a cell reference or a number.
+ * @param ref The string representing the operand (e.g., "A1", "50").
+ * @return The integer value.
+ */
+int get_cell_value_by_ref(const char* ref) {
+    int r, c;
+    // If it's a valid cell reference, return that cell's value
+    if (parse_cell_ref(ref, &r, &c)) {
+        return grid[r][c].value;
+    }
+    // Otherwise, assume it's a literal number and convert it
+    return atoi(ref);
+}
+
+/**
+ * @brief Removes leading and trailing whitespace from a string, in-place.
+ * @param str The string to trim.
+ */
+void trim_whitespace(char* str) {
+    if (str == NULL) return;
+    char* end;
+    
+    // Trim leading space
+    while (isspace((unsigned char)*str)) str++;
+    if (*str == 0) return; // All spaces
+
+    // Trim trailing space
+    end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) end--;
+    
+    // Write new null terminator
+    *(end + 1) = 0;
 }
