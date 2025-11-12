@@ -2,665 +2,481 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <termios.h>
+#include <unistd.h>
 #include <math.h>
 
-#define MAX_ROWS 100
-#define MAX_COLS 26
-#define MAX_FORMULA_LEN 256
-#define MAX_DISPLAY_WIDTH 12
+#define ROWS 99
+#define COLS 26
+#define MAX_FORMULA 256
+#define MAX_DISPLAY 10
 
 // Cell structure
 typedef struct {
-    char formula[MAX_FORMULA_LEN];
+    char formula[MAX_FORMULA];
     double value;
-    int is_formula;
+    int is_numeric;
     int error;
 } Cell;
 
-// Spreadsheet structure
+// Spreadsheet state
 typedef struct {
-    Cell cells[MAX_ROWS][MAX_COLS];
+    Cell cells[ROWS][COLS];
     int cursor_row;
     int cursor_col;
-    int view_row;
-    int view_col;
-} Spreadsheet;
+    int offset_row;
+    int offset_col;
+    char input_buffer[MAX_FORMULA];
+    int input_mode;
+} Sheet;
 
-Spreadsheet sheet;
+// Terminal handling
+struct termios orig_termios;
 
-// Function prototypes
-void init_spreadsheet();
-void display_spreadsheet();
-void move_cursor(int dr, int dc);
-void edit_cell();
-double evaluate_expression(const char* expr, int* error);
-double parse_formula(const char* formula, int* error);
-void recalculate_all();
-void save_spreadsheet(const char* filename);
-void load_spreadsheet(const char* filename);
-void print_help();
-char* get_cell_display(int row, int col);
-int col_letter_to_num(char c);
-char col_num_to_letter(int n);
-double get_cell_value(int row, int col);
-
-// Expression parsing
-double parse_sum(const char* str, int* pos, int* error);
-double parse_product(const char* str, int* pos, int* error);
-double parse_factor(const char* str, int* pos, int* error);
-double parse_function(const char* str, int* pos, int* error);
-void skip_whitespace(const char* str, int* pos);
-
-// Terminal control
-void clear_screen() {
-    printf("\033[2J\033[H");
+void disable_raw_mode() {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 }
 
-void init_spreadsheet() {
-    for (int i = 0; i < MAX_ROWS; i++) {
-        for (int j = 0; j < MAX_COLS; j++) {
-            sheet.cells[i][j].formula[0] = '\0';
-            sheet.cells[i][j].value = 0.0;
-            sheet.cells[i][j].is_formula = 0;
-            sheet.cells[i][j].error = 0;
+void enable_raw_mode() {
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    atexit(disable_raw_mode);
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+// ANSI escape codes
+void clear_screen() { printf("\033[2J\033[H"); }
+void move_cursor(int row, int col) { printf("\033[%d;%dH", row, col); }
+void hide_cursor() { printf("\033[?25l"); }
+void show_cursor() { printf("\033[?25h"); }
+
+// Forward declarations
+double evaluate_formula(Sheet *sheet, const char *formula, int row, int col);
+void calculate_all(Sheet *sheet);
+
+// Initialize spreadsheet
+void init_sheet(Sheet *sheet) {
+    memset(sheet, 0, sizeof(Sheet));
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            sheet->cells[r][c].value = 0.0;
+            sheet->cells[r][c].is_numeric = 0;
+            sheet->cells[r][c].error = 0;
+            sheet->cells[r][c].formula[0] = '\0';
         }
     }
-    sheet.cursor_row = 0;
-    sheet.cursor_col = 0;
-    sheet.view_row = 0;
-    sheet.view_col = 0;
 }
 
-char col_num_to_letter(int n) {
-    return 'A' + n;
-}
-
-int col_letter_to_num(char c) {
+// Convert column letter to index
+int col_to_index(char c) {
     return toupper(c) - 'A';
 }
 
-double get_cell_value(int row, int col) {
-    if (row < 0 || row >= MAX_ROWS || col < 0 || col >= MAX_COLS) {
-        return 0.0;
-    }
-    return sheet.cells[row][col].value;
-}
-
-void skip_whitespace(const char* str, int* pos) {
-    while (str[*pos] == ' ' || str[*pos] == '\t') {
-        (*pos)++;
-    }
-}
-
-double parse_factor(const char* str, int* pos, int* error) {
-    skip_whitespace(str, pos);
+// Parse cell reference like "A1" or "Z99"
+int parse_cell_ref(const char *ref, int *row, int *col) {
+    if (!isalpha(ref[0])) return 0;
+    *col = col_to_index(ref[0]);
+    if (*col < 0 || *col >= COLS) return 0;
     
-    // Handle parentheses
-    if (str[*pos] == '(') {
-        (*pos)++;
-        double result = parse_sum(str, pos, error);
-        skip_whitespace(str, pos);
-        if (str[*pos] == ')') {
-            (*pos)++;
-        } else {
-            *error = 1;
+    int r = atoi(ref + 1);
+    if (r < 1 || r > ROWS) return 0;
+    *row = r - 1;
+    return 1;
+}
+
+// Get cell value
+double get_cell_value(Sheet *sheet, int row, int col) {
+    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return 0.0;
+    if (sheet->cells[row][col].error) return 0.0;
+    return sheet->cells[row][col].value;
+}
+
+// Evaluate SUM function
+double eval_sum(Sheet *sheet, const char *args, int current_row, int current_col) {
+    int r1, c1, r2, c2;
+    char range[MAX_FORMULA];
+    strncpy(range, args, MAX_FORMULA - 1);
+    
+    char *colon = strchr(range, ':');
+    if (!colon) return 0.0;
+    
+    *colon = '\0';
+    char *start = range;
+    char *end = colon + 1;
+    
+    // Trim spaces
+    while (*start == ' ') start++;
+    while (*end == ' ') end++;
+    
+    if (!parse_cell_ref(start, &r1, &c1)) return 0.0;
+    if (!parse_cell_ref(end, &r2, &c2)) return 0.0;
+    
+    double sum = 0.0;
+    for (int r = r1; r <= r2; r++) {
+        for (int c = c1; c <= c2; c++) {
+            sum += get_cell_value(sheet, r, c);
         }
-        return result;
     }
+    return sum;
+}
+
+// Evaluate AVG function
+double eval_avg(Sheet *sheet, const char *args, int current_row, int current_col) {
+    int r1, c1, r2, c2;
+    char range[MAX_FORMULA];
+    strncpy(range, args, MAX_FORMULA - 1);
+    
+    char *colon = strchr(range, ':');
+    if (!colon) return 0.0;
+    
+    *colon = '\0';
+    char *start = range;
+    char *end = colon + 1;
+    
+    while (*start == ' ') start++;
+    while (*end == ' ') end++;
+    
+    if (!parse_cell_ref(start, &r1, &c1)) return 0.0;
+    if (!parse_cell_ref(end, &r2, &c2)) return 0.0;
+    
+    double sum = 0.0;
+    int count = 0;
+    for (int r = r1; r <= r2; r++) {
+        for (int c = c1; c <= c2; c++) {
+            sum += get_cell_value(sheet, r, c);
+            count++;
+        }
+    }
+    return count > 0 ? sum / count : 0.0;
+}
+
+// Simple expression evaluator
+double eval_expression(Sheet *sheet, char *expr, int row, int col) {
+    // Remove spaces
+    char clean[MAX_FORMULA];
+    int j = 0;
+    for (int i = 0; expr[i]; i++) {
+        if (expr[i] != ' ') clean[j++] = expr[i];
+    }
+    clean[j] = '\0';
     
     // Handle functions
-    if (isalpha(str[*pos]) && isupper(str[*pos])) {
-        // Check if it's a function or cell reference
-        if (str[*pos + 1] && isalpha(str[*pos + 1])) {
-            // It's a function
-            return parse_function(str, pos, error);
-        } else if (str[*pos + 1] && isdigit(str[*pos + 1])) {
-            // It's a cell reference
-            int col = col_letter_to_num(str[*pos]);
-            (*pos)++;
-            int row = 0;
-            while (isdigit(str[*pos])) {
-                row = row * 10 + (str[*pos] - '0');
-                (*pos)++;
-            }
-            row--; // Convert to 0-indexed
-            return get_cell_value(row, col);
+    if (strncmp(clean, "SUM(", 4) == 0) {
+        char *end = strchr(clean, ')');
+        if (end) {
+            *end = '\0';
+            return eval_sum(sheet, clean + 4, row, col);
         }
     }
     
-    // Handle numbers
-    if (isdigit(str[*pos]) || str[*pos] == '.' || str[*pos] == '-') {
-        char* endptr;
-        double result = strtod(str + *pos, &endptr);
-        *pos += (endptr - (str + *pos));
-        return result;
+    if (strncmp(clean, "AVG(", 4) == 0) {
+        char *end = strchr(clean, ')');
+        if (end) {
+            *end = '\0';
+            return eval_avg(sheet, clean + 4, row, col);
+        }
     }
     
-    *error = 1;
-    return 0.0;
-}
-
-double parse_product(const char* str, int* pos, int* error) {
-    double result = parse_factor(str, pos, error);
+    // Simple arithmetic parser (handles +, -, *, /)
+    // Parse terms separated by + or -
+    double result = 0.0;
+    char *ptr = clean;
+    int add = 1;
     
-    while (1) {
-        skip_whitespace(str, pos);
-        char op = str[*pos];
+    while (*ptr) {
+        double term = 1.0;
+        int multiply = 1;
         
-        if (op == '*' || op == '/') {
-            (*pos)++;
-            double right = parse_factor(str, pos, error);
-            if (op == '*') {
-                result *= right;
-            } else {
-                if (right == 0.0) {
-                    *error = 1;
-                    return 0.0;
-                }
-                result /= right;
-            }
-        } else {
-            break;
-        }
-    }
-    
-    return result;
-}
-
-double parse_sum(const char* str, int* pos, int* error) {
-    double result = parse_product(str, pos, error);
-    
-    while (1) {
-        skip_whitespace(str, pos);
-        char op = str[*pos];
-        
-        if (op == '+' || op == '-') {
-            (*pos)++;
-            double right = parse_product(str, pos, error);
-            if (op == '+') {
-                result += right;
-            } else {
-                result -= right;
-            }
-        } else {
-            break;
-        }
-    }
-    
-    return result;
-}
-
-double parse_function(const char* str, int* pos, int* error) {
-    char func_name[20];
-    int fn_idx = 0;
-    
-    while (isalpha(str[*pos])) {
-        func_name[fn_idx++] = str[*pos];
-        (*pos)++;
-    }
-    func_name[fn_idx] = '\0';
-    
-    skip_whitespace(str, pos);
-    if (str[*pos] != '(') {
-        *error = 1;
-        return 0.0;
-    }
-    (*pos)++;
-    
-    double values[100];
-    int val_count = 0;
-    
-    while (1) {
-        skip_whitespace(str, pos);
-        if (str[*pos] == ')') {
-            (*pos)++;
-            break;
-        }
-        
-        // Check for range (e.g., A1:A10)
-        if (isalpha(str[*pos]) && isdigit(str[*pos + 1])) {
-            int col1 = col_letter_to_num(str[*pos]);
-            (*pos)++;
-            int row1 = 0;
-            while (isdigit(str[*pos])) {
-                row1 = row1 * 10 + (str[*pos] - '0');
-                (*pos)++;
-            }
-            row1--;
+        // Parse factors separated by * or /
+        while (*ptr && *ptr != '+' && *ptr != '-') {
+            double factor = 0.0;
             
-            skip_whitespace(str, pos);
-            if (str[*pos] == ':') {
-                (*pos)++;
-                skip_whitespace(str, pos);
-                int col2 = col_letter_to_num(str[*pos]);
-                (*pos)++;
-                int row2 = 0;
-                while (isdigit(str[*pos])) {
-                    row2 = row2 * 10 + (str[*pos] - '0');
-                    (*pos)++;
+            // Check for cell reference
+            if (isalpha(*ptr)) {
+                char ref[10];
+                int k = 0;
+                while (isalnum(*ptr) && k < 9) {
+                    ref[k++] = *ptr++;
                 }
-                row2--;
+                ref[k] = '\0';
                 
-                // Add all cells in range
-                for (int r = row1; r <= row2; r++) {
-                    for (int c = col1; c <= col2; c++) {
-                        if (val_count < 100) {
-                            values[val_count++] = get_cell_value(r, c);
-                        }
-                    }
+                int r, c;
+                if (parse_cell_ref(ref, &r, &c)) {
+                    factor = get_cell_value(sheet, r, c);
                 }
-            } else {
-                values[val_count++] = get_cell_value(row1, col1);
             }
-        } else {
-            values[val_count++] = parse_sum(str, pos, error);
+            // Check for number
+            else if (isdigit(*ptr) || *ptr == '.') {
+                factor = strtod(ptr, &ptr);
+            }
+            else {
+                ptr++;
+                continue;
+            }
+            
+            if (multiply) {
+                term *= factor;
+            } else {
+                term /= factor;
+            }
+            
+            if (*ptr == '*') {
+                multiply = 1;
+                ptr++;
+            } else if (*ptr == '/') {
+                multiply = 0;
+                ptr++;
+            }
         }
         
-        skip_whitespace(str, pos);
-        if (str[*pos] == ',') {
-            (*pos)++;
+        if (add) {
+            result += term;
+        } else {
+            result -= term;
         }
-    }
-    
-    // Execute function
-    if (strcmp(func_name, "SUM") == 0) {
-        double sum = 0.0;
-        for (int i = 0; i < val_count; i++) sum += values[i];
-        return sum;
-    } else if (strcmp(func_name, "AVG") == 0 || strcmp(func_name, "AVERAGE") == 0) {
-        if (val_count == 0) return 0.0;
-        double sum = 0.0;
-        for (int i = 0; i < val_count; i++) sum += values[i];
-        return sum / val_count;
-    } else if (strcmp(func_name, "MIN") == 0) {
-        if (val_count == 0) return 0.0;
-        double min = values[0];
-        for (int i = 1; i < val_count; i++) {
-            if (values[i] < min) min = values[i];
+        
+        if (*ptr == '+') {
+            add = 1;
+            ptr++;
+        } else if (*ptr == '-') {
+            add = 0;
+            ptr++;
         }
-        return min;
-    } else if (strcmp(func_name, "MAX") == 0) {
-        if (val_count == 0) return 0.0;
-        double max = values[0];
-        for (int i = 1; i < val_count; i++) {
-            if (values[i] > max) max = values[i];
-        }
-        return max;
-    } else if (strcmp(func_name, "COUNT") == 0) {
-        return (double)val_count;
-    } else if (strcmp(func_name, "SQRT") == 0) {
-        if (val_count > 0) return sqrt(values[0]);
-        return 0.0;
-    } else if (strcmp(func_name, "ABS") == 0) {
-        if (val_count > 0) return fabs(values[0]);
-        return 0.0;
-    } else if (strcmp(func_name, "POW") == 0) {
-        if (val_count >= 2) return pow(values[0], values[1]);
-        return 0.0;
-    } else if (strcmp(func_name, "IF") == 0) {
-        if (val_count >= 3) {
-            return values[0] != 0.0 ? values[1] : values[2];
-        }
-        return 0.0;
-    }
-    
-    *error = 1;
-    return 0.0;
-}
-
-double parse_formula(const char* formula, int* error) {
-    *error = 0;
-    int pos = 0;
-    
-    // Skip leading '='
-    if (formula[pos] == '=') {
-        pos++;
-    }
-    
-    double result = parse_sum(formula, &pos, error);
-    
-    skip_whitespace(formula, &pos);
-    if (formula[pos] != '\0') {
-        *error = 1;
     }
     
     return result;
 }
 
-void recalculate_all() {
-    // Multiple passes for dependencies
-    for (int pass = 0; pass < 3; pass++) {
-        for (int i = 0; i < MAX_ROWS; i++) {
-            for (int j = 0; j < MAX_COLS; j++) {
-                Cell* cell = &sheet.cells[i][j];
-                if (cell->formula[0] != '\0') {
-                    if (cell->is_formula) {
-                        int error = 0;
-                        cell->value = parse_formula(cell->formula, &error);
-                        cell->error = error;
-                    } else {
-                        // Plain number
-                        cell->value = atof(cell->formula);
-                        cell->error = 0;
-                    }
-                }
-            }
-        }
+// Evaluate formula
+double evaluate_formula(Sheet *sheet, const char *formula, int row, int col) {
+    if (!formula || formula[0] == '\0') return 0.0;
+    
+    // If it starts with =, it's a formula
+    if (formula[0] == '=') {
+        char expr[MAX_FORMULA];
+        strncpy(expr, formula + 1, MAX_FORMULA - 1);
+        return eval_expression(sheet, expr, row, col);
     }
+    
+    // Otherwise try to parse as number
+    return strtod(formula, NULL);
 }
 
-char* get_cell_display(int row, int col) {
-    static char display[MAX_DISPLAY_WIDTH + 1];
-    Cell* cell = &sheet.cells[row][col];
+// Set cell formula and calculate
+void set_cell(Sheet *sheet, int row, int col, const char *formula) {
+    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return;
     
-    if (cell->formula[0] == '\0') {
-        strcpy(display, "");
-    } else if (cell->error) {
-        strcpy(display, "#ERROR");
-    } else if (cell->is_formula) {
-        snprintf(display, MAX_DISPLAY_WIDTH + 1, "%.2f", cell->value);
+    strncpy(sheet->cells[row][col].formula, formula, MAX_FORMULA - 1);
+    sheet->cells[row][col].formula[MAX_FORMULA - 1] = '\0';
+    sheet->cells[row][col].error = 0;
+    
+    if (formula[0] == '\0') {
+        sheet->cells[row][col].is_numeric = 0;
+        sheet->cells[row][col].value = 0.0;
+    } else if (formula[0] == '=') {
+        sheet->cells[row][col].is_numeric = 1;
+        sheet->cells[row][col].value = evaluate_formula(sheet, formula, row, col);
     } else {
-        snprintf(display, MAX_DISPLAY_WIDTH + 1, "%s", cell->formula);
-    }
-    
-    return display;
-}
-
-void display_spreadsheet() {
-    clear_screen();
-    
-    printf("=== SPREADSHEET === [%c%d] ===\n", 
-           col_num_to_letter(sheet.cursor_col), 
-           sheet.cursor_row + 1);
-    
-    // Display current cell formula
-    Cell* current = &sheet.cells[sheet.cursor_row][sheet.cursor_col];
-    printf("Formula: %s\n", current->formula[0] ? current->formula : "(empty)");
-    printf("Value: ");
-    if (current->error) {
-        printf("#ERROR\n");
-    } else if (current->formula[0]) {
-        printf("%.4f\n", current->value);
-    } else {
-        printf("(empty)\n");
-    }
-    printf("\n");
-    
-    // Column headers
-    printf("     ");
-    for (int j = sheet.view_col; j < sheet.view_col + 6 && j < MAX_COLS; j++) {
-        printf("     %c      ", col_num_to_letter(j));
-    }
-    printf("\n");
-    
-    printf("   +");
-    for (int j = sheet.view_col; j < sheet.view_col + 6 && j < MAX_COLS; j++) {
-        printf("------------+");
-    }
-    printf("\n");
-    
-    // Rows
-    for (int i = sheet.view_row; i < sheet.view_row + 15 && i < MAX_ROWS; i++) {
-        printf("%2d |", i + 1);
-        for (int j = sheet.view_col; j < sheet.view_col + 6 && j < MAX_COLS; j++) {
-            char* display = get_cell_display(i, j);
-            
-            if (i == sheet.cursor_row && j == sheet.cursor_col) {
-                printf("\033[7m"); // Reverse video
-            }
-            
-            printf(" %-11s", display);
-            
-            if (i == sheet.cursor_row && j == sheet.cursor_col) {
-                printf("\033[0m"); // Reset
-            }
-            
-            printf("|");
-        }
-        printf("\n");
-    }
-    
-    printf("   +");
-    for (int j = sheet.view_col; j < sheet.view_col + 6 && j < MAX_COLS; j++) {
-        printf("------------+");
-    }
-    printf("\n\n");
-    
-    printf("Commands: [Arrows]=Move [E]=Edit [S]=Save [L]=Load [Q]=Quit [H]=Help\n");
-}
-
-void move_cursor(int dr, int dc) {
-    sheet.cursor_row += dr;
-    sheet.cursor_col += dc;
-    
-    if (sheet.cursor_row < 0) sheet.cursor_row = 0;
-    if (sheet.cursor_row >= MAX_ROWS) sheet.cursor_row = MAX_ROWS - 1;
-    if (sheet.cursor_col < 0) sheet.cursor_col = 0;
-    if (sheet.cursor_col >= MAX_COLS) sheet.cursor_col = MAX_COLS - 1;
-    
-    // Adjust view if cursor is out of visible area
-    if (sheet.cursor_row < sheet.view_row) {
-        sheet.view_row = sheet.cursor_row;
-    }
-    if (sheet.cursor_row >= sheet.view_row + 15) {
-        sheet.view_row = sheet.cursor_row - 14;
-    }
-    if (sheet.cursor_col < sheet.view_col) {
-        sheet.view_col = sheet.cursor_col;
-    }
-    if (sheet.cursor_col >= sheet.view_col + 6) {
-        sheet.view_col = sheet.cursor_col - 5;
-    }
-}
-
-void edit_cell() {
-    Cell* cell = &sheet.cells[sheet.cursor_row][sheet.cursor_col];
-    
-    printf("\nEdit cell %c%d\n", 
-           col_num_to_letter(sheet.cursor_col), 
-           sheet.cursor_row + 1);
-    printf("Current: %s\n", cell->formula);
-    printf("Enter formula (or value, or press ENTER to clear): ");
-    
-    char input[MAX_FORMULA_LEN];
-    if (fgets(input, MAX_FORMULA_LEN, stdin)) {
-        // Remove newline
-        input[strcspn(input, "\n")] = 0;
-        
-        if (strlen(input) == 0) {
-            // Clear cell
-            cell->formula[0] = '\0';
-            cell->value = 0.0;
-            cell->is_formula = 0;
-            cell->error = 0;
+        char *endptr;
+        double val = strtod(formula, &endptr);
+        if (*endptr == '\0' && endptr != formula) {
+            sheet->cells[row][col].is_numeric = 1;
+            sheet->cells[row][col].value = val;
         } else {
-            strncpy(cell->formula, input, MAX_FORMULA_LEN - 1);
-            cell->formula[MAX_FORMULA_LEN - 1] = '\0';
-            
-            if (input[0] == '=') {
-                cell->is_formula = 1;
-            } else {
-                cell->is_formula = 0;
-            }
-            
-            recalculate_all();
+            sheet->cells[row][col].is_numeric = 0;
         }
     }
 }
 
-void save_spreadsheet(const char* filename) {
-    FILE* fp = fopen(filename, "w");
-    if (!fp) {
-        printf("Error: Could not open file for writing.\n");
-        printf("Press ENTER to continue...");
-        getchar();
-        return;
-    }
-    
-    // Save as CSV with formulas
-    for (int i = 0; i < MAX_ROWS; i++) {
-        int row_has_data = 0;
-        for (int j = 0; j < MAX_COLS; j++) {
-            if (sheet.cells[i][j].formula[0] != '\0') {
-                row_has_data = 1;
-                break;
-            }
-        }
-        
-        if (row_has_data) {
-            for (int j = 0; j < MAX_COLS; j++) {
-                fprintf(fp, "\"%s\"", sheet.cells[i][j].formula);
-                if (j < MAX_COLS - 1) fprintf(fp, ",");
-            }
-            fprintf(fp, "\n");
-        }
-    }
-    
-    fclose(fp);
-    printf("Saved to %s\n", filename);
-    printf("Press ENTER to continue...");
-    getchar();
-}
-
-void load_spreadsheet(const char* filename) {
-    FILE* fp = fopen(filename, "r");
-    if (!fp) {
-        printf("Error: Could not open file for reading.\n");
-        printf("Press ENTER to continue...");
-        getchar();
-        return;
-    }
-    
-    init_spreadsheet();
-    
-    char line[MAX_COLS * MAX_FORMULA_LEN];
-    int row = 0;
-    
-    while (fgets(line, sizeof(line), fp) && row < MAX_ROWS) {
-        int col = 0;
-        char* ptr = line;
-        
-        while (*ptr && col < MAX_COLS) {
-            // Skip whitespace
-            while (*ptr == ' ' || *ptr == '\t') ptr++;
-            
-            if (*ptr == '"') {
-                ptr++;
-                char* start = ptr;
-                while (*ptr && *ptr != '"') ptr++;
-                int len = ptr - start;
-                if (len > 0 && len < MAX_FORMULA_LEN) {
-                    strncpy(sheet.cells[row][col].formula, start, len);
-                    sheet.cells[row][col].formula[len] = '\0';
-                    
-                    if (sheet.cells[row][col].formula[0] == '=') {
-                        sheet.cells[row][col].is_formula = 1;
-                    }
+// Recalculate all cells
+void calculate_all(Sheet *sheet) {
+    for (int pass = 0; pass < 3; pass++) {  // Multiple passes for dependencies
+        for (int r = 0; r < ROWS; r++) {
+            for (int c = 0; c < COLS; c++) {
+                Cell *cell = &sheet->cells[r][c];
+                if (cell->formula[0] == '=') {
+                    cell->value = evaluate_formula(sheet, cell->formula, r, c);
                 }
-                if (*ptr == '"') ptr++;
             }
-            
-            while (*ptr == ',' || *ptr == ' ' || *ptr == '\t') ptr++;
-            col++;
         }
-        row++;
     }
-    
-    fclose(fp);
-    recalculate_all();
-    
-    printf("Loaded from %s\n", filename);
-    printf("Press ENTER to continue...");
-    getchar();
 }
 
-void print_help() {
+// Display spreadsheet
+void display_sheet(Sheet *sheet) {
     clear_screen();
-    printf("=== SPREADSHEET HELP ===\n\n");
-    printf("NAVIGATION:\n");
-    printf("  Arrow keys: w/a/s/d or i/j/k/l\n");
-    printf("  e - Edit current cell\n");
-    printf("  q - Quit program\n\n");
     
-    printf("CELL FORMULAS:\n");
-    printf("  Plain values: 123 or 45.67\n");
-    printf("  Formulas start with '=': =A1+B2\n");
-    printf("  Cell references: A1, B2, Z99\n");
-    printf("  Operators: + - * /\n");
-    printf("  Parentheses: =(A1+B2)*C3\n\n");
+    // Header
+    move_cursor(1, 1);
+    printf("   ");
+    for (int c = 0; c < 8 && (c + sheet->offset_col) < COLS; c++) {
+        printf("    %c     ", 'A' + c + sheet->offset_col);
+    }
     
-    printf("FUNCTIONS:\n");
-    printf("  SUM(A1:A10) - Sum of range\n");
-    printf("  AVG(A1:A10) - Average\n");
-    printf("  MIN(A1:A10) - Minimum\n");
-    printf("  MAX(A1:A10) - Maximum\n");
-    printf("  COUNT(A1:A10) - Count cells\n");
-    printf("  SQRT(A1) - Square root\n");
-    printf("  ABS(A1) - Absolute value\n");
-    printf("  POW(A1,2) - Power\n");
-    printf("  IF(A1>10,100,200) - Conditional\n\n");
-    
-    printf("FILE OPERATIONS:\n");
-    printf("  s - Save spreadsheet\n");
-    printf("  l - Load spreadsheet\n\n");
-    
-    printf("Press ENTER to continue...");
-    getchar();
-}
-
-int main() {
-    init_spreadsheet();
-    
-    // Sample data
-    strcpy(sheet.cells[0][0].formula, "Revenue");
-    strcpy(sheet.cells[1][0].formula, "100");
-    strcpy(sheet.cells[2][0].formula, "200");
-    strcpy(sheet.cells[3][0].formula, "150");
-    strcpy(sheet.cells[4][0].formula, "=SUM(A2:A4)");
-    sheet.cells[4][0].is_formula = 1;
-    
-    recalculate_all();
-    
-    char cmd;
-    while (1) {
-        display_spreadsheet();
+    // Grid
+    for (int r = 0; r < 20 && (r + sheet->offset_row) < ROWS; r++) {
+        move_cursor(r + 2, 1);
+        printf("%2d ", r + 1 + sheet->offset_row);
         
-        cmd = getchar();
-        if (cmd == '\n') continue;
-        
-        // Consume rest of line
-        while (getchar() != '\n');
-        
-        switch (cmd) {
-            case 'w': case 'i': move_cursor(-1, 0); break;
-            case 's': case 'k': move_cursor(1, 0); break;
-            case 'a': case 'j': move_cursor(0, -1); break;
-            case 'd': case 'l': move_cursor(0, 1); break;
-            case 'e': case 'E': edit_cell(); break;
-            case 'q': case 'Q': 
-                printf("Quit? (y/n): ");
-                if (getchar() == 'y') return 0;
-                while (getchar() != '\n');
-                break;
-            case 'h': case 'H': print_help(); break;
-            case 'S':
-                printf("Filename: ");
-                char savefile[256];
-                if (fgets(savefile, 256, stdin)) {
-                    savefile[strcspn(savefile, "\n")] = 0;
-                    save_spreadsheet(savefile);
+        for (int c = 0; c < 8 && (c + sheet->offset_col) < COLS; c++) {
+            int actual_r = r + sheet->offset_row;
+            int actual_c = c + sheet->offset_col;
+            Cell *cell = &sheet->cells[actual_r][actual_c];
+            
+            if (cell->formula[0] != '\0') {
+                if (cell->is_numeric) {
+                    printf("%9.2f ", cell->value);
+                } else {
+                    printf("%-9.9s ", cell->formula);
                 }
-                break;
-            case 'L':
-                printf("Filename: ");
-                char loadfile[256];
-                if (fgets(loadfile, 256, stdin)) {
-                    loadfile[strcspn(loadfile, "\n")] = 0;
-                    load_spreadsheet(loadfile);
-                }
-                break;
+            } else {
+                printf("          ");
+            }
         }
     }
+    
+    // Status line
+    move_cursor(23, 1);
+    printf("Cell: %c%d", 'A' + sheet->cursor_col, sheet->cursor_row + 1);
+    
+    move_cursor(24, 1);
+    Cell *current = &sheet->cells[sheet->cursor_row][sheet->cursor_col];
+    if (sheet->input_mode) {
+        printf("Edit: %s", sheet->input_buffer);
+    } else if (current->formula[0] != '\0') {
+        printf("Formula: %s", current->formula);
+    } else {
+        printf("Arrow keys:move | Enter:edit | S:save | L:load | Q:quit");
+    }
+    
+    // Position cursor
+    int screen_r = sheet->cursor_row - sheet->offset_row + 2;
+    int screen_c = (sheet->cursor_col - sheet->offset_col) * 10 + 4;
+    move_cursor(screen_r, screen_c);
+    
+    fflush(stdout);
+}
+
+// Save to file
+void save_sheet(Sheet *sheet, const char *filename) {
+    FILE *f = fopen(filename, "w");
+    if (!f) return;
+    
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            if (sheet->cells[r][c].formula[0] != '\0') {
+                fprintf(f, "%c%d=%s\n", 'A' + c, r + 1, sheet->cells[r][c].formula);
+            }
+        }
+    }
+    fclose(f);
+}
+
+// Load from file
+void load_sheet(Sheet *sheet, const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) return;
+    
+    init_sheet(sheet);
+    
+    char line[MAX_FORMULA + 10];
+    while (fgets(line, sizeof(line), f)) {
+        if (strlen(line) < 3) continue;
+        
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        
+        *eq = '\0';
+        char *formula = eq + 1;
+        
+        // Remove newline
+        char *nl = strchr(formula, '\n');
+        if (nl) *nl = '\0';
+        
+        int row, col;
+        if (parse_cell_ref(line, &row, &col)) {
+            set_cell(sheet, row, col, formula);
+        }
+    }
+    
+    fclose(f);
+    calculate_all(sheet);
+}
+
+// Main program
+int main() {
+    Sheet sheet;
+    init_sheet(&sheet);
+    
+    enable_raw_mode();
+    hide_cursor();
+    
+    int running = 1;
+    
+    while (running) {
+        display_sheet(&sheet);
+        
+        char c = getchar();
+        
+        if (sheet.input_mode) {
+            if (c == '\n' || c == '\r') {
+                // Finish editing
+                set_cell(&sheet, sheet.cursor_row, sheet.cursor_col, sheet.input_buffer);
+                calculate_all(&sheet);
+                sheet.input_mode = 0;
+                sheet.input_buffer[0] = '\0';
+            } else if (c == 27) {  // ESC
+                sheet.input_mode = 0;
+                sheet.input_buffer[0] = '\0';
+            } else if (c == 127 || c == 8) {  // Backspace
+                int len = strlen(sheet.input_buffer);
+                if (len > 0) sheet.input_buffer[len - 1] = '\0';
+            } else if (strlen(sheet.input_buffer) < MAX_FORMULA - 1 && c >= 32 && c < 127) {
+                int len = strlen(sheet.input_buffer);
+                sheet.input_buffer[len] = c;
+                sheet.input_buffer[len + 1] = '\0';
+            }
+        } else {
+            // Navigation mode
+            if (c == 'q' || c == 'Q') {
+                running = 0;
+            } else if (c == 's' || c == 'S') {
+                save_sheet(&sheet, "sheet.txt");
+            } else if (c == 'l' || c == 'L') {
+                load_sheet(&sheet, "sheet.txt");
+            } else if (c == '\n' || c == '\r' || c == 'e' || c == 'E') {
+                // Enter edit mode
+                sheet.input_mode = 1;
+                strncpy(sheet.input_buffer, sheet.cells[sheet.cursor_row][sheet.cursor_col].formula, MAX_FORMULA - 1);
+            } else if (c == 27) {  // Arrow keys
+                getchar();  // Skip [
+                c = getchar();
+                if (c == 'A' && sheet.cursor_row > 0) {  // Up
+                    sheet.cursor_row--;
+                    if (sheet.cursor_row < sheet.offset_row) sheet.offset_row = sheet.cursor_row;
+                } else if (c == 'B' && sheet.cursor_row < ROWS - 1) {  // Down
+                    sheet.cursor_row++;
+                    if (sheet.cursor_row >= sheet.offset_row + 20) sheet.offset_row = sheet.cursor_row - 19;
+                } else if (c == 'C' && sheet.cursor_col < COLS - 1) {  // Right
+                    sheet.cursor_col++;
+                    if (sheet.cursor_col >= sheet.offset_col + 8) sheet.offset_col = sheet.cursor_col - 7;
+                } else if (c == 'D' && sheet.cursor_col > 0) {  // Left
+                    sheet.cursor_col--;
+                    if (sheet.cursor_col < sheet.offset_col) sheet.offset_col = sheet.cursor_col;
+                }
+            } else if (c == 'd' || c == 'D') {  // Delete cell
+                set_cell(&sheet, sheet.cursor_row, sheet.cursor_col, "");
+                calculate_all(&sheet);
+            }
+        }
+    }
+    
+    show_cursor();
+    clear_screen();
+    move_cursor(1, 1);
     
     return 0;
 }
