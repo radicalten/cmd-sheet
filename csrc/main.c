@@ -85,6 +85,8 @@ void pasteCell(Spreadsheet *s);
 void deleteCell(Spreadsheet *s, int row, int col);
 int parseCell(const char *ref, int *row, int *col);
 double getCellNumber(Spreadsheet *s, int row, int col);
+int isRangeRef(const char *str);
+void processRange(Spreadsheet *s, const char *range, double *values, int *count, int maxCount);
 
 // Global variables
 static struct termios orig_termios;
@@ -197,6 +199,65 @@ int parseCell(const char *ref, int *row, int *col) {
     return 1;
 }
 
+// Check if a string is a range reference (e.g., "A1:B5")
+int isRangeRef(const char *str) {
+    if (!str || !isalpha(str[0])) return 0;
+    
+    const char *colon = strchr(str, ':');
+    if (!colon) return 0;
+    
+    // Check if part before colon is a cell ref
+    int i = 1;
+    while (str[i] && &str[i] < colon) {
+        if (!isdigit(str[i])) return 0;
+        i++;
+    }
+    
+    // Check if part after colon is a cell ref
+    if (!isalpha(colon[1])) return 0;
+    i = 2;
+    while (colon[i]) {
+        if (!isdigit(colon[i])) return 0;
+        i++;
+    }
+    
+    return 1;
+}
+
+// Process a range and add all values to the values array
+void processRange(Spreadsheet *s, const char *range, double *values, int *count, int maxCount) {
+    char start[32], end[32];
+    int i = 0, j = 0;
+    
+    // Parse range "A1:B5"
+    while (range[i] && range[i] != ':' && j < 31) {
+        start[j++] = range[i++];
+    }
+    start[j] = '\0';
+    
+    if (range[i] != ':') return;
+    i++; j = 0;
+    
+    while (range[i] && j < 31) {
+        end[j++] = range[i++];
+    }
+    end[j] = '\0';
+    
+    int r1, c1, r2, c2;
+    if (!parseCell(start, &r1, &c1) || !parseCell(end, &r2, &c2)) return;
+    
+    // Ensure r1 <= r2 and c1 <= c2
+    if (r1 > r2) { int t = r1; r1 = r2; r2 = t; }
+    if (c1 > c2) { int t = c1; c1 = c2; c2 = t; }
+    
+    // Add all values in range
+    for (int r = r1; r <= r2 && *count < maxCount; r++) {
+        for (int c = c1; c <= c2 && *count < maxCount; c++) {
+            values[(*count)++] = getCellNumber(s, r, c);
+        }
+    }
+}
+
 // Get numeric value from cell
 double getCellNumber(Spreadsheet *s, int row, int col) {
     if (row < 0 || row >= MAX_ROWS || col < 0 || col >= MAX_COLS)
@@ -270,7 +331,7 @@ const char *getToken(const char *p, Token *tok) {
     // Functions and cell references
     if (isalpha(*p)) {
         int i = 0;
-        while (isalnum(*p) && i < 63) {
+        while ((isalnum(*p) || *p == ':') && i < 63) {
             tok->strValue[i++] = toupper(*p++);
         }
         tok->strValue[i] = '\0';
@@ -282,21 +343,10 @@ const char *getToken(const char *p, Token *tok) {
             strcmp(tok->strValue, "ABS") == 0 || strcmp(tok->strValue, "SQRT") == 0 ||
             strcmp(tok->strValue, "POW") == 0 || strcmp(tok->strValue, "IF") == 0) {
             tok->type = TOK_FUNC;
+        } else if (isRangeRef(tok->strValue)) {
+            tok->type = TOK_RANGE;
         } else if (strlen(tok->strValue) >= 2 && isalpha(tok->strValue[0]) && isdigit(tok->strValue[1])) {
-            // Check for range (A1:A10)
-            const char *colon = p;
-            if (*colon == ':' && isalpha(colon[1])) {
-                tok->type = TOK_RANGE;
-                colon++;
-                while (isalnum(*colon)) {
-                    if (i < 63) tok->strValue[i++] = toupper(*colon++);
-                    else colon++;
-                }
-                tok->strValue[i] = '\0';
-                p = colon;
-            } else {
-                tok->type = TOK_CELL;
-            }
+            tok->type = TOK_CELL;
         } else {
             tok->type = TOK_CELL;
         }
@@ -307,89 +357,92 @@ const char *getToken(const char *p, Token *tok) {
     return p;
 }
 
-// Evaluate range functions
-double evalRange(Spreadsheet *s, const char *range, const char *func, int *error) {
-    char start[32], end[32];
-    int i = 0, j = 0;
+// Expression evaluator (recursive descent parser)
+double parseExpression(Spreadsheet *s, const char **p, int *error);
+double parseTerm(Spreadsheet *s, const char **p, int *error);
+double parseFactor(Spreadsheet *s, const char **p, int *error);
+
+// New function to handle SUM and similar aggregate functions
+double handleAggregateFunction(Spreadsheet *s, const char *funcName, const char **p, int *error) {
+    Token tok;
+    *p = getToken(*p, &tok);
     
-    // Parse range "A1:A10"
-    while (range[i] && range[i] != ':' && j < 31) {
-        start[j++] = range[i++];
-    }
-    start[j] = '\0';
-    
-    if (range[i] != ':') {
-        *error = 1;
-        return 0.0;
-    }
-    i++; j = 0;
-    
-    while (range[i] && j < 31) {
-        end[j++] = range[i++];
-    }
-    end[j] = '\0';
-    
-    int r1, c1, r2, c2;
-    if (!parseCell(start, &r1, &c1) || !parseCell(end, &r2, &c2)) {
+    if (tok.type != TOK_LPAREN) {
         *error = 1;
         return 0.0;
     }
     
-    // Ensure r1 <= r2 and c1 <= c2
-    if (r1 > r2) { int t = r1; r1 = r2; r2 = t; }
-    if (c1 > c2) { int t = c1; c1 = c2; c2 = t; }
-    
-    double result = 0.0;
+    double values[1000];  // Buffer for all values
     int count = 0;
+    int maxCount = 1000;
     
-    if (strcmp(func, "SUM") == 0) {
-        for (int r = r1; r <= r2; r++) {
-            for (int c = c1; c <= c2; c++) {
-                result += getCellNumber(s, r, c);
-            }
+    // Process all arguments
+    while (1) {
+        *p = skipWhitespace(*p);
+        
+        // Check for empty argument list
+        const char *peek = *p;
+        Token peekTok;
+        peek = getToken(peek, &peekTok);
+        if (peekTok.type == TOK_RPAREN) {
+            *p = peek;
+            break;
         }
-    } else if (strcmp(func, "AVG") == 0 || strcmp(func, "AVERAGE") == 0) {
-        for (int r = r1; r <= r2; r++) {
-            for (int c = c1; c <= c2; c++) {
-                result += getCellNumber(s, r, c);
-                count++;
-            }
+        
+        // Check if it's a range
+        peek = *p;
+        peek = getToken(peek, &peekTok);
+        if (peekTok.type == TOK_RANGE) {
+            *p = peek;
+            processRange(s, peekTok.strValue, values, &count, maxCount);
+        } else {
+            // It's an expression (could be cell, number, or complex expression)
+            double val = parseExpression(s, p, error);
+            if (*error) return 0.0;
+            if (count < maxCount) values[count++] = val;
         }
-        result = count > 0 ? result / count : 0.0;
-    } else if (strcmp(func, "MIN") == 0) {
-        result = INFINITY;
-        for (int r = r1; r <= r2; r++) {
-            for (int c = c1; c <= c2; c++) {
-                double val = getCellNumber(s, r, c);
-                if (val < result) result = val;
-            }
+        
+        // Check for comma or closing paren
+        *p = getToken(*p, &tok);
+        if (tok.type == TOK_RPAREN) {
+            break;
+        } else if (tok.type != TOK_COMMA) {
+            *error = 1;
+            return 0.0;
         }
-        if (result == INFINITY) result = 0.0;
-    } else if (strcmp(func, "MAX") == 0) {
-        result = -INFINITY;
-        for (int r = r1; r <= r2; r++) {
-            for (int c = c1; c <= c2; c++) {
-                double val = getCellNumber(s, r, c);
-                if (val > result) result = val;
-            }
+    }
+    
+    // Calculate result based on function
+    double result = 0.0;
+    
+    if (strcmp(funcName, "SUM") == 0) {
+        for (int i = 0; i < count; i++) {
+            result += values[i];
         }
-        if (result == -INFINITY) result = 0.0;
-    } else if (strcmp(func, "COUNT") == 0) {
-        for (int r = r1; r <= r2; r++) {
-            for (int c = c1; c <= c2; c++) {
-                if (s->cells[r][c].type != CELL_EMPTY) count++;
-            }
+    } else if (strcmp(funcName, "AVG") == 0 || strcmp(funcName, "AVERAGE") == 0) {
+        if (count == 0) return 0.0;
+        for (int i = 0; i < count; i++) {
+            result += values[i];
         }
+        result /= count;
+    } else if (strcmp(funcName, "MIN") == 0) {
+        if (count == 0) return 0.0;
+        result = values[0];
+        for (int i = 1; i < count; i++) {
+            if (values[i] < result) result = values[i];
+        }
+    } else if (strcmp(funcName, "MAX") == 0) {
+        if (count == 0) return 0.0;
+        result = values[0];
+        for (int i = 1; i < count; i++) {
+            if (values[i] > result) result = values[i];
+        }
+    } else if (strcmp(funcName, "COUNT") == 0) {
         result = count;
     }
     
     return result;
 }
-
-// Expression evaluator (recursive descent parser)
-double parseExpression(Spreadsheet *s, const char **p, int *error);
-double parseTerm(Spreadsheet *s, const char **p, int *error);
-double parseFactor(Spreadsheet *s, const char **p, int *error);
 
 double parseFactor(Spreadsheet *s, const char **p, int *error) {
     Token tok;
@@ -408,30 +461,29 @@ double parseFactor(Spreadsheet *s, const char **p, int *error) {
         return 0.0;
     }
     
+    if (tok.type == TOK_RANGE) {
+        // A range by itself is an error (needs to be in a function)
+        *error = 1;
+        return 0.0;
+    }
+    
     if (tok.type == TOK_FUNC) {
-        Token next;
-        const char *peek = getToken(*p, &next);
+        // Handle aggregate functions with new improved handler
+        if (strcmp(tok.strValue, "SUM") == 0 || strcmp(tok.strValue, "AVG") == 0 ||
+            strcmp(tok.strValue, "AVERAGE") == 0 || strcmp(tok.strValue, "MIN") == 0 ||
+            strcmp(tok.strValue, "MAX") == 0 || strcmp(tok.strValue, "COUNT") == 0) {
+            return handleAggregateFunction(s, tok.strValue, p, error);
+        }
         
+        // Handle other functions
+        Token next;
+        *p = getToken(*p, &next);
         if (next.type != TOK_LPAREN) {
             *error = 1;
             return 0.0;
         }
-        *p = peek;
         
-        // Handle range functions
-        *p = getToken(*p, &next);
-        if (next.type == TOK_RANGE) {
-            double result = evalRange(s, next.strValue, tok.strValue, error);
-            *p = getToken(*p, &next);
-            if (next.type != TOK_RPAREN) *error = 1;
-            return result;
-        }
-        
-        // Handle regular functions
         if (strcmp(tok.strValue, "ABS") == 0) {
-            if (next.type == TOK_RPAREN) { *error = 1; return 0.0; }
-            *p = getToken(*p, &next);
-            *p = skipWhitespace(*p - 1);
             double arg = parseExpression(s, p, error);
             *p = getToken(*p, &next);
             if (next.type != TOK_RPAREN) *error = 1;
@@ -439,9 +491,6 @@ double parseFactor(Spreadsheet *s, const char **p, int *error) {
         }
         
         if (strcmp(tok.strValue, "SQRT") == 0) {
-            if (next.type == TOK_RPAREN) { *error = 1; return 0.0; }
-            *p = getToken(*p, &next);
-            *p = skipWhitespace(*p - 1);
             double arg = parseExpression(s, p, error);
             *p = getToken(*p, &next);
             if (next.type != TOK_RPAREN) *error = 1;
@@ -449,9 +498,6 @@ double parseFactor(Spreadsheet *s, const char **p, int *error) {
         }
         
         if (strcmp(tok.strValue, "POW") == 0) {
-            if (next.type == TOK_RPAREN) { *error = 1; return 0.0; }
-            *p = getToken(*p, &next);
-            *p = skipWhitespace(*p - 1);
             double arg1 = parseExpression(s, p, error);
             *p = getToken(*p, &next);
             if (next.type != TOK_COMMA) { *error = 1; return 0.0; }
@@ -459,45 +505,6 @@ double parseFactor(Spreadsheet *s, const char **p, int *error) {
             *p = getToken(*p, &next);
             if (next.type != TOK_RPAREN) *error = 1;
             return pow(arg1, arg2);
-        }
-        
-        if (strcmp(tok.strValue, "SUM") == 0 || strcmp(tok.strValue, "AVG") == 0 ||
-            strcmp(tok.strValue, "AVERAGE") == 0 || strcmp(tok.strValue, "MIN") == 0 ||
-            strcmp(tok.strValue, "MAX") == 0) {
-            // Handle multiple arguments
-            double result = 0.0;
-            int count = 0;
-            double minVal = INFINITY, maxVal = -INFINITY;
-            
-            if (next.type != TOK_RPAREN) {
-                *p = skipWhitespace(*p - 1);
-                do {
-                    double val = parseExpression(s, p, error);
-                    if (strcmp(tok.strValue, "SUM") == 0) {
-                        result += val;
-                    } else if (strcmp(tok.strValue, "MIN") == 0) {
-                        if (val < minVal) minVal = val;
-                    } else if (strcmp(tok.strValue, "MAX") == 0) {
-                        if (val > maxVal) maxVal = val;
-                    } else {
-                        result += val;
-                    }
-                    count++;
-                    
-                    *p = getToken(*p, &next);
-                } while (next.type == TOK_COMMA);
-            }
-            
-            if (next.type != TOK_RPAREN) { *error = 1; return 0.0; }
-            
-            if (strcmp(tok.strValue, "AVG") == 0 || strcmp(tok.strValue, "AVERAGE") == 0)
-                return count > 0 ? result / count : 0.0;
-            if (strcmp(tok.strValue, "MIN") == 0)
-                return minVal == INFINITY ? 0.0 : minVal;
-            if (strcmp(tok.strValue, "MAX") == 0)
-                return maxVal == -INFINITY ? 0.0 : maxVal;
-            
-            return result;
         }
         
         *error = 1;
@@ -897,21 +904,22 @@ void showHelp() {
     printf("  Operators: +, -, *, /, ^\n");
     printf("  Cell refs: A1, B2, etc.\n\n");
     
-    printf(BOLD "FUNCTIONS:\n" RESET);
-    printf("  SUM(A1:A10)   - Sum range\n");
-    printf("  AVG(A1:A10)   - Average range\n");
-    printf("  MIN(A1:A10)   - Minimum value\n");
-    printf("  MAX(A1:A10)   - Maximum value\n");
-    printf("  COUNT(A1:A10) - Count cells\n");
+    printf(BOLD "FUNCTIONS (Excel-compatible):\n" RESET);
+    printf("  SUM(args)     - Sum of all arguments\n");
+    printf("  AVG(args)     - Average of all arguments\n");
+    printf("  MIN(args)     - Minimum value\n");
+    printf("  MAX(args)     - Maximum value\n");
+    printf("  COUNT(args)   - Count of all arguments\n");
     printf("  ABS(value)    - Absolute value\n");
     printf("  SQRT(value)   - Square root\n");
     printf("  POW(x,y)      - Power x^y\n\n");
     
-    printf(BOLD "EXAMPLES:\n" RESET);
-    printf("  =A1+B1        - Add two cells\n");
-    printf("  =SUM(A1:A10)  - Sum range A1 to A10\n");
-    printf("  =A1*2+B2      - Expression\n");
-    printf("  =SQRT(A1)     - Square root of A1\n\n");
+    printf(BOLD "EXCEL-STYLE EXAMPLES:\n" RESET);
+    printf("  =SUM(A1:A10)          - Sum range\n");
+    printf("  =SUM(A1:A3, B1:B3)    - Sum multiple ranges\n");
+    printf("  =SUM(A1, B1, C1)      - Sum individual cells\n");
+    printf("  =SUM(A1:A3, 10, B1)   - Mix ranges, cells, and numbers\n");
+    printf("  =SUM(A:A)             - Not supported (use specific range)\n\n");
     
     printf(YELLOW "Press any key to return..." RESET);
     getch_custom();
@@ -1261,6 +1269,12 @@ int main() {
     
     setCellValue(&sheet, 5, 0, "Total:");
     setCellValue(&sheet, 5, 3, "=SUM(D2:D4)");
+    
+    // Additional demo: Excel-style mixed SUM
+    setCellValue(&sheet, 7, 0, "Mixed SUM:");
+    setCellValue(&sheet, 7, 1, "100");
+    setCellValue(&sheet, 7, 2, "200");
+    setCellValue(&sheet, 7, 3, "=SUM(B8:C8, 50, D2:D4)");
     
     evaluateAllCells(&sheet);
     sheet.modified = 0;
