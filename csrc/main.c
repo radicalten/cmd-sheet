@@ -43,12 +43,14 @@ typedef struct {
     CellType type;
     double numValue;
     int width;
+    int dirty;  // Flag to track if cell needs redrawing
 } Cell;
 
 typedef struct {
     Cell cells[MAX_ROWS][MAX_COLS];
     int curRow, curCol;
     int topRow, leftCol;
+    int prevCurRow, prevCurCol;  // Track previous cursor position
     char filename[256];
     int modified;
     char statusMsg[256];
@@ -56,11 +58,15 @@ typedef struct {
     char editBuffer[MAX_CELL_LEN];
     int editPos;
     int screenRows, screenCols;
+    int needsFullRedraw;  // Flag for full screen redraw
+    int statusDirty;      // Flag for status bar update
 } Spreadsheet;
 
 // Function prototypes
 void initSpreadsheet(Spreadsheet *s);
 void drawSpreadsheet(Spreadsheet *s);
+void drawCell(Spreadsheet *s, int row, int col);
+void drawStatusBar(Spreadsheet *s);
 void handleInput(Spreadsheet *s);
 void evaluateCell(Spreadsheet *s, int row, int col);
 void evaluateAllCells(Spreadsheet *s);
@@ -141,6 +147,16 @@ void moveCursor(int row, int col) {
     printf("\033[%d;%dH", row, col);
 }
 
+void hideCursor() {
+    printf("\033[?25l");
+    fflush(stdout);
+}
+
+void showCursor() {
+    printf("\033[?25h");
+    fflush(stdout);
+}
+
 // Initialize spreadsheet
 void initSpreadsheet(Spreadsheet *s) {
     memset(s, 0, sizeof(Spreadsheet));
@@ -150,15 +166,20 @@ void initSpreadsheet(Spreadsheet *s) {
             s->cells[i][j].width = 10;
             s->cells[i][j].raw[0] = '\0';
             s->cells[i][j].display[0] = '\0';
+            s->cells[i][j].dirty = 1;
         }
     }
     s->curRow = 0;
     s->curCol = 0;
+    s->prevCurRow = -1;
+    s->prevCurCol = -1;
     s->topRow = 0;
     s->leftCol = 0;
     s->modified = 0;
     s->editMode = 0;
     s->editPos = 0;
+    s->needsFullRedraw = 1;
+    s->statusDirty = 1;
     strcpy(s->statusMsg, "Ready. Press F1 for help, Ctrl+Q to quit");
     getTerminalSize(&s->screenRows, &s->screenCols);
 }
@@ -616,6 +637,7 @@ void evaluateAllCells(Spreadsheet *s) {
             for (int j = 0; j < MAX_COLS; j++) {
                 if (s->cells[i][j].type == CELL_FORMULA) {
                     evaluateCell(s, i, j);
+                    s->cells[i][j].dirty = 1;
                 }
             }
         }
@@ -649,6 +671,7 @@ void setCellValue(Spreadsheet *s, int row, int col, const char *value) {
         }
     }
     
+    cell->dirty = 1;
     s->modified = 1;
 }
 
@@ -660,69 +683,71 @@ void copyCell(Spreadsheet *s) {
     Cell *cell = &s->cells[s->curRow][s->curCol];
     strncpy(clipboard, cell->raw, MAX_CELL_LEN - 1);
     strcpy(s->statusMsg, "Cell copied");
+    s->statusDirty = 1;
 }
 
 void pasteCell(Spreadsheet *s) {
     setCellValue(s, s->curRow, s->curCol, clipboard);
     strcpy(s->statusMsg, "Cell pasted");
+    s->statusDirty = 1;
 }
 
-void drawSpreadsheet(Spreadsheet *s) {
-    clearScreen();
-    
-    int visibleRows = s->screenRows - 4;
+// Draw a single cell at its position
+void drawCell(Spreadsheet *s, int row, int col) {
     int visibleCols = (s->screenCols - 5) / 12;
     
-    // Title bar
-    printf(BG_BLUE BOLD WHITE "  SpreadSheet Pro v1.0");
-    for (int i = 22; i < s->screenCols; i++) printf(" ");
-    printf(RESET "\n");
+    // Check if cell is visible
+    if (row < s->topRow || row >= s->topRow + (s->screenRows - 4)) return;
+    if (col < s->leftCol || col >= s->leftCol + visibleCols) return;
     
-    // Column headers
-    printf("     ");
-    for (int c = s->leftCol; c < s->leftCol + visibleCols && c < MAX_COLS; c++) {
-        printf(BOLD CYAN "%-12c" RESET, 'A' + c);
-    }
-    printf("\n");
+    // Calculate screen position
+    int screenRow = 3 + (row - s->topRow);
+    int screenCol = 5 + (col - s->leftCol) * 12;
     
-    // Rows
-    for (int r = s->topRow; r < s->topRow + visibleRows && r < MAX_ROWS; r++) {
-        printf(BOLD CYAN "%3d " RESET, r + 1);
-        
-        for (int c = s->leftCol; c < s->leftCol + visibleCols && c < MAX_COLS; c++) {
-            Cell *cell = &s->cells[r][c];
-            
-            if (r == s->curRow && c == s->curCol) {
-                printf(BG_CYAN);
-            }
-            
-            char formatted[13];
-            if (strlen(cell->display) > 11) {
-                strncpy(formatted, cell->display, 9);
-                formatted[9] = '.';
-                formatted[10] = '.';
-                formatted[11] = '\0';
-            } else {
-                strcpy(formatted, cell->display);
-            }
-            
-            if (cell->type == CELL_ERROR) {
-                printf(RED "%-12s" RESET, formatted);
-            } else if (cell->type == CELL_NUMBER || cell->type == CELL_FORMULA) {
-                printf(GREEN "%-12s" RESET, formatted);
-            } else {
-                printf("%-12s", formatted);
-            }
-            
-            if (r == s->curRow && c == s->curCol) {
-                printf(RESET);
-            }
-        }
-        printf("\n");
+    Cell *cell = &s->cells[row][col];
+    
+    // Move cursor to cell position
+    moveCursor(screenRow, screenCol);
+    
+    // Apply highlighting if this is current cell
+    if (row == s->curRow && col == s->curCol) {
+        printf(BG_CYAN);
     }
     
-    // Status bar
-    printf("\n" BG_WHITE "  ");
+    // Format cell content
+    char formatted[13];
+    if (strlen(cell->display) > 11) {
+        strncpy(formatted, cell->display, 9);
+        formatted[9] = '.';
+        formatted[10] = '.';
+        formatted[11] = '\0';
+    } else {
+        strcpy(formatted, cell->display);
+    }
+    
+    // Apply color based on cell type
+    if (cell->type == CELL_ERROR) {
+        printf(RED "%-12s" RESET, formatted);
+    } else if (cell->type == CELL_NUMBER || cell->type == CELL_FORMULA) {
+        printf(GREEN "%-12s" RESET, formatted);
+    } else {
+        printf("%-12s", formatted);
+    }
+    
+    if (row == s->curRow && col == s->curCol) {
+        printf(RESET);
+    }
+    
+    fflush(stdout);
+    cell->dirty = 0;
+}
+
+// Draw the status bar
+void drawStatusBar(Spreadsheet *s) {
+    // Status line 1 - cell reference and content
+    moveCursor(s->screenRows - 1, 1);
+    printf(BG_WHITE "  ");
+    
     char cellRef[8];
     snprintf(cellRef, sizeof(cellRef), "%c%d", 'A' + s->curCol, s->curRow + 1);
     printf(BOLD "%s: " RESET, cellRef);
@@ -736,17 +761,111 @@ void drawSpreadsheet(Spreadsheet *s) {
         }
     }
     
-    for (int i = strlen(cellRef) + strlen(s->editMode ? s->editBuffer : s->cells[s->curRow][s->curCol].raw) + 10;
-         i < s->screenCols; i++) {
-        printf(" ");
-    }
+    // Clear to end of line
+    printf("\033[K");
     printf(RESET "\n");
     
+    // Status line 2 - status message
     printf(BG_WHITE "  " RESET);
     printf(MAGENTA "%s" RESET, s->statusMsg);
-    for (int i = strlen(s->statusMsg) + 2; i < s->screenCols; i++) printf(" ");
+    printf("\033[K");  // Clear to end of line
     
     fflush(stdout);
+    s->statusDirty = 0;
+}
+
+void drawSpreadsheet(Spreadsheet *s) {
+    int visibleRows = s->screenRows - 4;
+    int visibleCols = (s->screenCols - 5) / 12;
+    
+    if (s->needsFullRedraw) {
+        hideCursor();
+        clearScreen();
+        
+        // Title bar
+        printf(BG_BLUE BOLD WHITE "  SpreadSheet Pro v1.0");
+        for (int i = 22; i < s->screenCols; i++) printf(" ");
+        printf(RESET "\n");
+        
+        // Column headers
+        printf("     ");
+        for (int c = s->leftCol; c < s->leftCol + visibleCols && c < MAX_COLS; c++) {
+            printf(BOLD CYAN "%-12c" RESET, 'A' + c);
+        }
+        printf("\n");
+        
+        // Row numbers and all cells
+        for (int r = s->topRow; r < s->topRow + visibleRows && r < MAX_ROWS; r++) {
+            printf(BOLD CYAN "%3d " RESET, r + 1);
+            
+            for (int c = s->leftCol; c < s->leftCol + visibleCols && c < MAX_COLS; c++) {
+                Cell *cell = &s->cells[r][c];
+                
+                if (r == s->curRow && c == s->curCol) {
+                    printf(BG_CYAN);
+                }
+                
+                char formatted[13];
+                if (strlen(cell->display) > 11) {
+                    strncpy(formatted, cell->display, 9);
+                    formatted[9] = '.';
+                    formatted[10] = '.';
+                    formatted[11] = '\0';
+                } else {
+                    strcpy(formatted, cell->display);
+                }
+                
+                if (cell->type == CELL_ERROR) {
+                    printf(RED "%-12s" RESET, formatted);
+                } else if (cell->type == CELL_NUMBER || cell->type == CELL_FORMULA) {
+                    printf(GREEN "%-12s" RESET, formatted);
+                } else {
+                    printf("%-12s", formatted);
+                }
+                
+                if (r == s->curRow && c == s->curCol) {
+                    printf(RESET);
+                }
+                
+                cell->dirty = 0;
+            }
+            printf("\n");
+        }
+        
+        s->needsFullRedraw = 0;
+        s->statusDirty = 1;
+    } else {
+        // Incremental update - only redraw changed cells
+        
+        // Redraw previous cursor position if it changed
+        if (s->prevCurRow >= 0 && s->prevCurCol >= 0 &&
+            (s->prevCurRow != s->curRow || s->prevCurCol != s->curCol)) {
+            drawCell(s, s->prevCurRow, s->prevCurCol);
+        }
+        
+        // Redraw current cursor position
+        drawCell(s, s->curRow, s->curCol);
+        
+        // Redraw any dirty cells
+        for (int r = s->topRow; r < s->topRow + visibleRows && r < MAX_ROWS; r++) {
+            for (int c = s->leftCol; c < s->leftCol + visibleCols && c < MAX_COLS; c++) {
+                if (s->cells[r][c].dirty) {
+                    drawCell(s, r, c);
+                }
+            }
+        }
+    }
+    
+    // Update status bar if needed
+    if (s->statusDirty) {
+        drawStatusBar(s);
+    }
+    
+    // Update previous cursor position
+    s->prevCurRow = s->curRow;
+    s->prevCurCol = s->curCol;
+    
+    showCursor();
 }
 
 void showHelp() {
@@ -802,6 +921,7 @@ void saveSpreadsheet(Spreadsheet *s, const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) {
         strcpy(s->statusMsg, "Error: Cannot save file");
+        s->statusDirty = 1;
         return;
     }
     
@@ -820,12 +940,14 @@ void saveSpreadsheet(Spreadsheet *s, const char *filename) {
     s->modified = 0;
     strcpy(s->filename, filename);
     snprintf(s->statusMsg, sizeof(s->statusMsg), "Saved to %s", filename);
+    s->statusDirty = 1;
 }
 
 void loadSpreadsheet(Spreadsheet *s, const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
         strcpy(s->statusMsg, "Error: Cannot open file");
+        s->statusDirty = 1;
         return;
     }
     
@@ -833,6 +955,7 @@ void loadSpreadsheet(Spreadsheet *s, const char *filename) {
     if (!fgets(header, sizeof(header), fp) || strncmp(header, "SPREADSHEET_V1", 14) != 0) {
         fclose(fp);
         strcpy(s->statusMsg, "Error: Invalid file format");
+        s->statusDirty = 1;
         return;
     }
     
@@ -856,12 +979,15 @@ void loadSpreadsheet(Spreadsheet *s, const char *filename) {
     s->modified = 0;
     strcpy(s->filename, filename);
     snprintf(s->statusMsg, sizeof(s->statusMsg), "Loaded from %s", filename);
+    s->needsFullRedraw = 1;
+    s->statusDirty = 1;
 }
 
 void exportCSV(Spreadsheet *s, const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) {
         strcpy(s->statusMsg, "Error: Cannot export file");
+        s->statusDirty = 1;
         return;
     }
     
@@ -892,6 +1018,7 @@ void exportCSV(Spreadsheet *s, const char *filename) {
     
     fclose(fp);
     snprintf(s->statusMsg, sizeof(s->statusMsg), "Exported to %s", filename);
+    s->statusDirty = 1;
 }
 
 void handleInput(Spreadsheet *s) {
@@ -903,6 +1030,7 @@ void handleInput(Spreadsheet *s) {
             s->editBuffer[0] = '\0';
             s->editPos = 0;
             strcpy(s->statusMsg, "Edit cancelled");
+            s->statusDirty = 1;
         } else if (c == '\n' || c == '\r') {
             setCellValue(s, s->curRow, s->curCol, s->editBuffer);
             evaluateAllCells(s);
@@ -910,13 +1038,16 @@ void handleInput(Spreadsheet *s) {
             s->editBuffer[0] = '\0';
             s->editPos = 0;
             strcpy(s->statusMsg, "Cell updated");
+            s->statusDirty = 1;
         } else if (c == 127 || c == 8) { // Backspace
             if (s->editPos > 0) {
                 s->editBuffer[--s->editPos] = '\0';
+                s->statusDirty = 1;
             }
         } else if (c >= 32 && c < 127 && s->editPos < MAX_CELL_LEN - 1) {
             s->editBuffer[s->editPos++] = c;
             s->editBuffer[s->editPos] = '\0';
+            s->statusDirty = 1;
         }
         return;
     }
@@ -932,46 +1063,72 @@ void handleInput(Spreadsheet *s) {
                 case 'A': // Up
                     if (s->curRow > 0) {
                         s->curRow--;
-                        if (s->curRow < s->topRow) s->topRow = s->curRow;
+                        if (s->curRow < s->topRow) {
+                            s->topRow = s->curRow;
+                            s->needsFullRedraw = 1;
+                        }
+                        s->statusDirty = 1;
                     }
                     break;
                 case 'B': // Down
                     if (s->curRow < MAX_ROWS - 1) {
                         s->curRow++;
                         int visibleRows = s->screenRows - 4;
-                        if (s->curRow >= s->topRow + visibleRows) s->topRow = s->curRow - visibleRows + 1;
+                        if (s->curRow >= s->topRow + visibleRows) {
+                            s->topRow = s->curRow - visibleRows + 1;
+                            s->needsFullRedraw = 1;
+                        }
+                        s->statusDirty = 1;
                     }
                     break;
                 case 'C': // Right
                     if (s->curCol < MAX_COLS - 1) {
                         s->curCol++;
                         int visibleCols = (s->screenCols - 5) / 12;
-                        if (s->curCol >= s->leftCol + visibleCols) s->leftCol = s->curCol - visibleCols + 1;
+                        if (s->curCol >= s->leftCol + visibleCols) {
+                            s->leftCol = s->curCol - visibleCols + 1;
+                            s->needsFullRedraw = 1;
+                        }
+                        s->statusDirty = 1;
                     }
                     break;
                 case 'D': // Left
                     if (s->curCol > 0) {
                         s->curCol--;
-                        if (s->curCol < s->leftCol) s->leftCol = s->curCol;
+                        if (s->curCol < s->leftCol) {
+                            s->leftCol = s->curCol;
+                            s->needsFullRedraw = 1;
+                        }
+                        s->statusDirty = 1;
                     }
                     break;
                 case '5': // Page Up
                     getch_custom(); // consume '~'
                     s->curRow = (s->curRow > 10) ? s->curRow - 10 : 0;
                     s->topRow = (s->topRow > 10) ? s->topRow - 10 : 0;
+                    s->needsFullRedraw = 1;
+                    s->statusDirty = 1;
                     break;
                 case '6': // Page Down
                     getch_custom(); // consume '~'
                     s->curRow = (s->curRow < MAX_ROWS - 10) ? s->curRow + 10 : MAX_ROWS - 1;
                     int visibleRows = s->screenRows - 4;
-                    if (s->curRow >= s->topRow + visibleRows) s->topRow = s->curRow - visibleRows + 1;
+                    if (s->curRow >= s->topRow + visibleRows) {
+                        s->topRow = s->curRow - visibleRows + 1;
+                    }
+                    s->needsFullRedraw = 1;
+                    s->statusDirty = 1;
                     break;
                 case 'H': // Home
                     s->curCol = 0;
                     s->leftCol = 0;
+                    s->needsFullRedraw = 1;
+                    s->statusDirty = 1;
                     break;
                 case 'F': // End
                     s->curCol = MAX_COLS - 1;
+                    s->needsFullRedraw = 1;
+                    s->statusDirty = 1;
                     break;
             }
         }
@@ -980,10 +1137,12 @@ void handleInput(Spreadsheet *s) {
         strcpy(s->editBuffer, s->cells[s->curRow][s->curCol].raw);
         s->editPos = strlen(s->editBuffer);
         strcpy(s->statusMsg, "Editing cell (ESC to cancel, Enter to confirm)");
+        s->statusDirty = 1;
     } else if (c == 127 || c == 'd') { // Delete
         deleteCell(s, s->curRow, s->curCol);
         evaluateAllCells(s);
         strcpy(s->statusMsg, "Cell deleted");
+        s->statusDirty = 1;
     } else if (c == 3) { // Ctrl+C
         copyCell(s);
     } else if (c == 22) { // Ctrl+V
@@ -991,7 +1150,9 @@ void handleInput(Spreadsheet *s) {
         evaluateAllCells(s);
     } else if (c == 19) { // Ctrl+S
         char filename[256];
-        printf("\n\nEnter filename to save: ");
+        moveCursor(s->screenRows, 1);
+        printf("\033[K");
+        printf("Enter filename to save: ");
         disableRawMode();
         fgets(filename, sizeof(filename), stdin);
         filename[strcspn(filename, "\n")] = '\0';
@@ -1001,10 +1162,14 @@ void handleInput(Spreadsheet *s) {
             saveSpreadsheet(s, filename);
         } else {
             strcpy(s->statusMsg, "Save cancelled");
+            s->statusDirty = 1;
         }
+        s->needsFullRedraw = 1;
     } else if (c == 12) { // Ctrl+L
         char filename[256];
-        printf("\n\nEnter filename to load: ");
+        moveCursor(s->screenRows, 1);
+        printf("\033[K");
+        printf("Enter filename to load: ");
         disableRawMode();
         fgets(filename, sizeof(filename), stdin);
         filename[strcspn(filename, "\n")] = '\0';
@@ -1014,10 +1179,14 @@ void handleInput(Spreadsheet *s) {
             loadSpreadsheet(s, filename);
         } else {
             strcpy(s->statusMsg, "Load cancelled");
+            s->statusDirty = 1;
+            s->needsFullRedraw = 1;
         }
     } else if (c == 5) { // Ctrl+E
         char filename[256];
-        printf("\n\nEnter CSV filename to export: ");
+        moveCursor(s->screenRows, 1);
+        printf("\033[K");
+        printf("Enter CSV filename to export: ");
         disableRawMode();
         fgets(filename, sizeof(filename), stdin);
         filename[strcspn(filename, "\n")] = '\0';
@@ -1027,10 +1196,14 @@ void handleInput(Spreadsheet *s) {
             exportCSV(s, filename);
         } else {
             strcpy(s->statusMsg, "Export cancelled");
+            s->statusDirty = 1;
         }
+        s->needsFullRedraw = 1;
     } else if (c == 17) { // Ctrl+Q
         if (s->modified) {
-            printf("\n\nFile modified. Save before quitting? (y/n): ");
+            moveCursor(s->screenRows, 1);
+            printf("\033[K");
+            printf("File modified. Save before quitting? (y/n): ");
             disableRawMode();
             char response = getchar();
             enableRawMode();
@@ -1055,6 +1228,7 @@ void handleInput(Spreadsheet *s) {
         exit(0);
     } else if (c == 'h' || c == '?') { // Help
         showHelp();
+        s->needsFullRedraw = 1;
     }
 }
 
@@ -1092,7 +1266,15 @@ int main() {
     sheet.modified = 0;
     
     while (1) {
+        int oldRows = sheet.screenRows;
+        int oldCols = sheet.screenCols;
         getTerminalSize(&sheet.screenRows, &sheet.screenCols);
+        
+        // Trigger full redraw on terminal resize
+        if (oldRows != sheet.screenRows || oldCols != sheet.screenCols) {
+            sheet.needsFullRedraw = 1;
+        }
+        
         drawSpreadsheet(&sheet);
         handleInput(&sheet);
     }
