@@ -314,94 +314,173 @@ double evaluate_function(Spreadsheet *sheet, const char *func, const char *args)
     return 0;
 }
 
+// Forward declarations for recursive descent parser
+double parse_expression(Spreadsheet *sheet, const char **expr_ptr);
+double parse_term(Spreadsheet *sheet, const char **expr_ptr);
+double parse_factor(Spreadsheet *sheet, const char **expr_ptr);
+
+void skip_whitespace(const char **expr_ptr) {
+    while (**expr_ptr == ' ' || **expr_ptr == '\t') {
+        (*expr_ptr)++;
+    }
+}
+
+// Parse a factor: number, cell reference, or parenthesized expression
+double parse_factor(Spreadsheet *sheet, const char **expr_ptr) {
+    skip_whitespace(expr_ptr);
+    
+    const char *e = *expr_ptr;
+    
+    // Handle parentheses
+    if (*e == '(') {
+        e++;
+        *expr_ptr = e;
+        double result = parse_expression(sheet, expr_ptr);
+        skip_whitespace(expr_ptr);
+        if (**expr_ptr == ')') {
+            (*expr_ptr)++;
+        }
+        return result;
+    }
+    
+    // Handle unary minus
+    if (*e == '-') {
+        e++;
+        *expr_ptr = e;
+        return -parse_factor(sheet, expr_ptr);
+    }
+    
+    // Handle unary plus
+    if (*e == '+') {
+        e++;
+        *expr_ptr = e;
+        return parse_factor(sheet, expr_ptr);
+    }
+    
+    // Handle cell references (letter followed by digit)
+    if (isalpha(*e)) {
+        char ref[10];
+        int i = 0;
+        while ((isalpha(*e) || isdigit(*e)) && i < 9) {
+            ref[i++] = *e++;
+        }
+        ref[i] = '\0';
+        *expr_ptr = e;
+        
+        int row, col;
+        parse_cell_ref(ref, &row, &col);
+        return get_cell_value(sheet, row, col);
+    }
+    
+    // Handle numbers
+    if (isdigit(*e) || *e == '.') {
+        char *end;
+        double value = strtod(e, (char **)&end);
+        *expr_ptr = end;
+        return value;
+    }
+    
+    return 0;
+}
+
+// Parse a term: handles * and /
+double parse_term(Spreadsheet *sheet, const char **expr_ptr) {
+    double result = parse_factor(sheet, expr_ptr);
+    
+    skip_whitespace(expr_ptr);
+    
+    while (**expr_ptr == '*' || **expr_ptr == '/') {
+        char op = **expr_ptr;
+        (*expr_ptr)++;
+        double right = parse_factor(sheet, expr_ptr);
+        
+        if (op == '*') {
+            result *= right;
+        } else {
+            if (right != 0) {
+                result /= right;
+            } else {
+                result = 0; // Division by zero returns 0
+            }
+        }
+        
+        skip_whitespace(expr_ptr);
+    }
+    
+    return result;
+}
+
+// Parse an expression: handles + and -
+double parse_expression(Spreadsheet *sheet, const char **expr_ptr) {
+    double result = parse_term(sheet, expr_ptr);
+    
+    skip_whitespace(expr_ptr);
+    
+    while (**expr_ptr == '+' || **expr_ptr == '-') {
+        char op = **expr_ptr;
+        (*expr_ptr)++;
+        double right = parse_term(sheet, expr_ptr);
+        
+        if (op == '+') {
+            result += right;
+        } else {
+            result -= right;
+        }
+        
+        skip_whitespace(expr_ptr);
+    }
+    
+    return result;
+}
+
 double evaluate_expression(Spreadsheet *sheet, const char *expr) {
     char expr_copy[MAX_FORMULA_LEN];
     strcpy(expr_copy, expr);
     
     // Remove leading '='
-    char *e = expr_copy;
+    const char *e = expr_copy;
     if (*e == '=') e++;
     
     // Skip whitespace
-    while (*e == ' ') e++;
+    while (*e == ' ' || *e == '\t') e++;
     
-    // Check for functions
+    // Check for functions (SUM, AVG, etc.)
     if (isalpha(*e)) {
-        char func_name[50];
-        int i = 0;
-        while (isalpha(*e) && i < 49) {
-            func_name[i++] = *e++;
-        }
-        func_name[i] = '\0';
+        // Look ahead to see if it's a function call
+        const char *lookahead = e;
+        while (isalpha(*lookahead)) lookahead++;
+        while (*lookahead == ' ' || *lookahead == '\t') lookahead++;
         
-        if (*e == '(') {
-            e++;
-            char args[MAX_FORMULA_LEN];
-            int paren_count = 1;
-            i = 0;
-            while (*e && paren_count > 0) {
-                if (*e == '(') paren_count++;
-                else if (*e == ')') paren_count--;
-                if (paren_count > 0) args[i++] = *e;
-                e++;
-            }
-            args[i] = '\0';
-            return evaluate_function(sheet, func_name, args);
-        } else {
-            // Cell reference
-            e = expr_copy;
-            if (*e == '=') e++;
-            while (*e == ' ') e++;
-            
-            if (isalpha(*e) && isdigit(*(e+1))) {
-                int row, col;
-                parse_cell_ref(e, &row, &col);
-                return get_cell_value(sheet, row, col);
-            }
-        }
-    }
-    
-    // Simple arithmetic expression parser
-    double result = 0;
-    double current_num = 0;
-    char op = '+';
-    e = expr_copy;
-    if (*e == '=') e++;
-    
-    while (*e) {
-        if (*e == ' ') {
-            e++;
-            continue;
-        }
-        
-        if (isdigit(*e) || *e == '.') {
-            current_num = strtod(e, &e);
-        } else if (isalpha(*e)) {
-            // Cell reference
-            char ref[10];
+        if (*lookahead == '(') {
+            // It's a function
+            char func_name[50];
             int i = 0;
-            while (isalnum(*e)) ref[i++] = *e++;
-            ref[i] = '\0';
-            int row, col;
-            parse_cell_ref(ref, &row, &col);
-            current_num = get_cell_value(sheet, row, col);
-        }
-        
-        if (*e == '+' || *e == '-' || *e == '*' || *e == '/' || *e == '\0') {
-            switch (op) {
-                case '+': result += current_num; break;
-                case '-': result -= current_num; break;
-                case '*': result *= current_num; break;
-                case '/': result = current_num != 0 ? result / current_num : 0; break;
+            while (isalpha(*e) && i < 49) {
+                func_name[i++] = *e++;
             }
-            if (*e) op = *e++;
-            current_num = 0;
-        } else if (*e) {
-            e++;
+            func_name[i] = '\0';
+            
+            while (*e == ' ' || *e == '\t') e++;
+            
+            if (*e == '(') {
+                e++;
+                char args[MAX_FORMULA_LEN];
+                int paren_count = 1;
+                i = 0;
+                while (*e && paren_count > 0 && i < MAX_FORMULA_LEN - 1) {
+                    if (*e == '(') paren_count++;
+                    else if (*e == ')') paren_count--;
+                    if (paren_count > 0) args[i++] = *e;
+                    e++;
+                }
+                args[i] = '\0';
+                return evaluate_function(sheet, func_name, args);
+            }
         }
     }
     
-    return result;
+    // Use recursive descent parser for arithmetic expressions
+    return parse_expression(sheet, &e);
 }
 
 void invalidate_formulas(Spreadsheet *sheet) {
