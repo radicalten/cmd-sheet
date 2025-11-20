@@ -1,763 +1,496 @@
-// ASCII Shmup - Single-file, no external deps
-// Cross-platform terminal game (Windows, Linux, macOS)
-// Inspired by classic shmups; original code and assets.
-//
-// Build:
-//   Linux/macOS: gcc -O2 -std=c99 shmup.c -o shmup
-//   Windows (MSVC): cl /O2 shmup.c
-//   Windows (MinGW): gcc -O2 -std=c99 shmup.c -o shmup.exe
-//
-// Controls: Left/Right arrows or A/D, Space=Fire, P=Pause, Q=Quit, R=Restart (after game over)
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <math.h>
+#include <unistd.h>
+#include <termios.h>
+#include <fcntl.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-  #include <conio.h>
-#else
-  #include <unistd.h>
-  #include <termios.h>
-  #include <fcntl.h>
-  #include <sys/ioctl.h>
-  #include <sys/time.h>
-  #include <errno.h>
-#endif
+#define WIDTH 80
+#define HEIGHT 24
+#define MAX_BULLETS 50
+#define MAX_ENEMIES 20
+#define MAX_POWERUPS 5
+#define MAX_PARTICLES 100
 
-// -------------------- Config --------------------
-#define SCREEN_W 80
-#define SCREEN_H 28
-
-#define MAX_PBUL 64
-#define MAX_EBUL 64
-#define ENEMY_ROWS 4
-#define ENEMY_COLS 10
-#define MAX_ENEMIES (ENEMY_ROWS*ENEMY_COLS)
-#define MAX_DIVERS 4
-#define STAR_COUNT 80
-
-#define PLAYER_CHAR '^'
-#define ENEMY_CHAR 'W'
-#define DIVER_CHAR 'V'
-#define P_BUL_CHAR '|'
-#define E_BUL_CHAR 'v'
-#define EXPLO_CHAR '*'
-
-#define HEADER_H 2
-
-// -------------------- Utility --------------------
-static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
-static int imin(int a, int b) { return a < b ? a : b; }
-static int imax(int a, int b) { return a > b ? a : b; }
-
-static unsigned int xorshift32_state = 0x12345678u;
-static unsigned int xrnd() {
-    // xorshift32
-    unsigned int x = xorshift32_state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    xorshift32_state = x;
-    return x;
-}
-static int irand(int lo, int hi) { // inclusive
-    if (hi <= lo) return lo;
-    return (int)(lo + (xrnd() % (unsigned)(hi - lo + 1)));
-}
-
-// -------------------- Platform Abstraction --------------------
-static void out_flush() { fflush(stdout); }
-
-static void hide_cursor() { fputs("\x1b[?25l", stdout); }
-static void show_cursor() { fputs("\x1b[?25h", stdout); }
-static void clear_screen_full() { fputs("\x1b[2J", stdout); }
-static void cursor_home() { fputs("\x1b[H", stdout); }
-
-#ifdef _WIN32
-static HANDLE g_hOut;
-static DWORD g_origOutMode = 0;
-static int platform_initialized = 0;
-
-static void platform_init() {
-    if (platform_initialized) return;
-    platform_initialized = 1;
-    // Init RNG seed
-    xorshift32_state = (unsigned)time(NULL) ^ 0xA5A5A5A5u;
-
-    g_hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (g_hOut != INVALID_HANDLE_VALUE) {
-        DWORD mode = 0;
-        if (GetConsoleMode(g_hOut, &mode)) {
-            g_origOutMode = mode;
-            mode |= ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            SetConsoleMode(g_hOut, mode);
-        }
-    }
-
-    // No need to set input raw; we'll use _kbhit/_getch
-    // Hide cursor and clear
-    hide_cursor();
-    clear_screen_full();
-    cursor_home();
-    // Buffering to speed prints
-    setvbuf(stdout, NULL, _IOFBF, 0);
-}
-
-static void platform_shutdown() {
-    if (!platform_initialized) return;
-    platform_initialized = 0;
-    if (g_hOut != INVALID_HANDLE_VALUE) {
-        SetConsoleMode(g_hOut, g_origOutMode);
-    }
-    show_cursor();
-}
-
-static void sleep_ms(int ms) { Sleep(ms); }
-
-static double now_sec() {
-    static LARGE_INTEGER freq = {0};
-    static LARGE_INTEGER start = {0};
-    static int inited = 0;
-    LARGE_INTEGER t;
-    if (!inited) {
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&start);
-        inited = 1;
-    }
-    QueryPerformanceCounter(&t);
-    return (double)(t.QuadPart - start.QuadPart) / (double)freq.QuadPart;
-}
-
-static int read_key_nonblock() {
-    if (_kbhit()) {
-        int c = _getch();
-        // Arrow keys: prefix 0 or 224, then code
-        if (c == 0 || c == 224) {
-            int c2 = _getch();
-            if (c2 == 75) return 1000 + 'L'; // Left
-            if (c2 == 77) return 1000 + 'R'; // Right
-            if (c2 == 72) return 1000 + 'U'; // Up
-            if (c2 == 80) return 1000 + 'D'; // Down
-            return -1;
-        }
-        return c;
-    }
-    return -1;
-}
-
-#else // POSIX
-static struct termios g_origTerm;
-static int term_raw_enabled = 0;
-
-static void set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) flags = 0;
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static void enable_raw() {
-    if (term_raw_enabled) return;
-    term_raw_enabled = 1;
-    tcgetattr(STDIN_FILENO, &g_origTerm);
-    struct termios raw = g_origTerm;
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-    set_nonblocking(STDIN_FILENO);
-}
-
-static void disable_raw() {
-    if (!term_raw_enabled) return;
-    term_raw_enabled = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &g_origTerm);
-}
-
-static void platform_init() {
-    xorshift32_state = (unsigned)time(NULL) ^ 0x5A5A5A5Au;
-    enable_raw();
-    hide_cursor();
-    clear_screen_full();
-    cursor_home();
-    setvbuf(stdout, NULL, _IOFBF, 0);
-}
-
-static void platform_shutdown() {
-    show_cursor();
-    disable_raw();
-}
-
-static void sleep_ms(int ms) {
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
-}
-
-static double now_sec() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
-static int read_key_nonblock() {
-    unsigned char c;
-    int n = (int)read(STDIN_FILENO, &c, 1);
-    if (n <= 0) return -1;
-    if (c == 0x1B) { // ESC sequence
-        unsigned char buf[2];
-        // Try to read next two bytes if present
-        int n1 = (int)read(STDIN_FILENO, &buf[0], 1);
-        if (n1 <= 0) return 27;
-        if (buf[0] != '[') return 27;
-        int n2 = (int)read(STDIN_FILENO, &buf[1], 1);
-        if (n2 <= 0) return 27;
-        if (buf[1] == 'D') return 1000 + 'L'; // Left
-        if (buf[1] == 'C') return 1000 + 'R'; // Right
-        if (buf[1] == 'A') return 1000 + 'U'; // Up
-        if (buf[1] == 'B') return 1000 + 'D'; // Down
-        return -1;
-    }
-    return (int)c;
-}
-#endif
-
-// -------------------- Game Types --------------------
 typedef struct {
-    int x, y;
-    int alive;
-    int dy;
-    char ch;
+    float x, y;
+    int active;
 } Bullet;
 
 typedef struct {
     float x, y;
-    int alive;
-    int mode;    // 0=formation, 1=diving, 2=returning
-    float vx, vy;
-    int row, col; // formation cell
-    int expl_timer; // explosion frames
+    int type;
+    int health;
+    int active;
+    float speed;
+    int shoot_timer;
 } Enemy;
 
 typedef struct {
     float x, y;
-    float speed;
-    char ch;
-} Star;
+    int type;
+    int active;
+} PowerUp;
 
 typedef struct {
-    int left, right, fire, quit, pause, restart;
-} Input;
+    float x, y;
+    int life;
+    char c;
+    int active;
+} Particle;
 
-// -------------------- Game State --------------------
-static char screen[SCREEN_H][SCREEN_W + 1];
-static int running = 1;
+typedef struct {
+    float x, y;
+    int lives;
+    int score;
+    int power_level;
+    int invincible;
+} Player;
 
-static int player_x = SCREEN_W / 2;
-static int player_y = SCREEN_H - 2;
-static int fire_cooldown = 0;
-static int player_inv = 0; // frames of invincibility after hit
+char screen[HEIGHT][WIDTH];
+Player player;
+Bullet bullets[MAX_BULLETS];
+Bullet enemy_bullets[MAX_BULLETS];
+Enemy enemies[MAX_ENEMIES];
+PowerUp powerups[MAX_POWERUPS];
+Particle particles[MAX_PARTICLES];
+int game_over = 0;
+int frame = 0;
+struct termios orig_termios;
 
-static Bullet pbul[MAX_PBUL];
-static Bullet ebul[MAX_EBUL];
-
-static Enemy enemies[MAX_ENEMIES];
-static int enemies_alive = 0;
-
-static float form_x = 10.0f;
-static float form_y = 4.0f;
-static int form_dir = 1; // 1 right, -1 left
-static float form_speed = 0.25f;
-
-static int wave = 1;
-static int score = 0;
-static int lives = 3;
-
-static Star stars[STAR_COUNT];
-
-static int paused = 0;
-static int game_over = 0;
-
-// -------------------- Helpers --------------------
-static void draw_text(int x, int y, const char* s) {
-    if (y < 0 || y >= SCREEN_H) return;
-    for (int i = 0; s[i] && x + i < SCREEN_W; ++i) {
-        if (x + i >= 0) screen[y][x + i] = s[i];
-    }
+void disable_raw_mode() {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 }
 
-static void clear_screen_buffer() {
-    for (int y = 0; y < SCREEN_H; ++y) {
-        for (int x = 0; x < SCREEN_W; ++x) screen[y][x] = ' ';
-        screen[y][SCREEN_W] = '\0';
-    }
+void enable_raw_mode() {
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    atexit(disable_raw_mode);
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 }
 
-static void present_screen() {
-    cursor_home();
-    for (int y = 0; y < SCREEN_H; ++y) {
-        fputs(screen[y], stdout);
-        fputc('\n', stdout);
-    }
-    out_flush();
+void clear_screen() {
+    printf("\033[2J\033[H");
 }
 
-static void init_stars() {
-    for (int i = 0; i < STAR_COUNT; ++i) {
-        stars[i].x = (float)irand(0, SCREEN_W - 1);
-        stars[i].y = (float)irand(HEADER_H, SCREEN_H - 2);
-        stars[i].speed = 0.1f + 0.3f * ((xrnd() % 100) / 100.0f);
-        stars[i].ch = (xrnd() % 4 == 0) ? '*' : '.';
-    }
+void init_game() {
+    player.x = 10;
+    player.y = HEIGHT / 2;
+    player.lives = 3;
+    player.score = 0;
+    player.power_level = 0;
+    player.invincible = 0;
+    
+    memset(bullets, 0, sizeof(bullets));
+    memset(enemy_bullets, 0, sizeof(enemy_bullets));
+    memset(enemies, 0, sizeof(enemies));
+    memset(powerups, 0, sizeof(powerups));
+    memset(particles, 0, sizeof(particles));
+    
+    srand(time(NULL));
 }
 
-static void update_stars() {
-    for (int i = 0; i < STAR_COUNT; ++i) {
-        stars[i].y += stars[i].speed;
-        if ((int)stars[i].y >= SCREEN_H - 1) {
-            stars[i].y = (float)HEADER_H;
-            stars[i].x = (float)irand(0, SCREEN_W - 1);
-            stars[i].speed = 0.1f + 0.3f * ((xrnd() % 100) / 100.0f);
-            stars[i].ch = (xrnd() % 5 == 0) ? '*' : '.';
-        }
-    }
-}
-
-static void draw_stars() {
-    for (int i = 0; i < STAR_COUNT; ++i) {
-        int x = (int)stars[i].x;
-        int y = (int)stars[i].y;
-        if (x >= 0 && x < SCREEN_W && y >= HEADER_H && y < SCREEN_H - 1) {
-            if (screen[y][x] == ' ') screen[y][x] = stars[i].ch;
-        }
-    }
-}
-
-static void reset_bullets() {
-    for (int i = 0; i < MAX_PBUL; ++i) pbul[i].alive = 0;
-    for (int i = 0; i < MAX_EBUL; ++i) ebul[i].alive = 0;
-}
-
-static void spawn_pbullet(int x, int y) {
-    for (int i = 0; i < MAX_PBUL; ++i) {
-        if (!pbul[i].alive) {
-            pbul[i].alive = 1;
-            pbul[i].x = x;
-            pbul[i].y = y;
-            pbul[i].dy = -1;
-            pbul[i].ch = P_BUL_CHAR;
+void add_particle(float x, float y, char c) {
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (!particles[i].active) {
+            particles[i].x = x;
+            particles[i].y = y;
+            particles[i].c = c;
+            particles[i].life = 5 + rand() % 5;
+            particles[i].active = 1;
             break;
         }
     }
 }
 
-static void spawn_ebullet(int x, int y) {
-    for (int i = 0; i < MAX_EBUL; ++i) {
-        if (!ebul[i].alive) {
-            ebul[i].alive = 1;
-            ebul[i].x = x;
-            ebul[i].y = y;
-            ebul[i].dy = 1;
-            ebul[i].ch = E_BUL_CHAR;
-            break;
-        }
-    }
-}
-
-static void init_enemies() {
-    enemies_alive = 0;
-    for (int r = 0; r < ENEMY_ROWS; ++r) {
-        for (int c = 0; c < ENEMY_COLS; ++c) {
-            int idx = r * ENEMY_COLS + c;
-            Enemy *e = &enemies[idx];
-            e->alive = 1;
-            e->mode = 0;
-            e->row = r;
-            e->col = c;
-            e->x = 0;
-            e->y = 0;
-            e->vx = 0;
-            e->vy = 0;
-            e->expl_timer = 0;
-            enemies_alive++;
-        }
-    }
-    // formation start
-    form_x = 8.0f;
-    form_y = 4.0f;
-    form_dir = 1;
-    form_speed = 0.2f + 0.03f * (float)(wave - 1);
-}
-
-static void next_wave() {
-    wave++;
-    init_enemies();
-}
-
-static void reset_game() {
-    score = 0;
-    lives = 3;
-    wave = 1;
-    player_x = SCREEN_W / 2;
-    player_y = SCREEN_H - 2;
-    fire_cooldown = 0;
-    player_inv = 0;
-    paused = 0;
-    game_over = 0;
-    init_stars();
-    reset_bullets();
-    init_enemies();
-}
-
-// compute formation cell position on screen for a given row/col
-static void formation_cell_pos(int row, int col, int* ox, int* oy) {
-    int spacing_x = 6;
-    int spacing_y = 2;
-    int left = (int)form_x;
-    int top = (int)form_y;
-    *ox = left + col * spacing_x;
-    *oy = top + row * spacing_y;
-}
-
-static void try_enemy_fire() {
-    // Randomly choose an alive enemy to shoot
-    // Probability increases with wave slightly
-    int chance = 12 + (wave * 2); // out of 1000
-    if ((xrnd() % 1000) < chance) {
-        int attempts = 20;
-        while (attempts-- > 0) {
-            int idx = irand(0, MAX_ENEMIES - 1);
-            Enemy* e = &enemies[idx];
-            if (!e->alive) continue;
-            int ex, ey;
-            if (e->mode == 0) {
-                formation_cell_pos(e->row, e->col, &ex, &ey);
-            } else {
-                ex = (int)e->x; ey = (int)e->y;
-            }
-            if (ey >= HEADER_H && ey < SCREEN_H - 2) {
-                spawn_ebullet(ex, ey + 1);
-                break;
-            }
-        }
-    }
-}
-
-static void maybe_launch_diver() {
-    // Occasionally pick a top-row or side enemy to dive
-    if ((xrnd() % 1000) < 8 + wave) {
-        // pick a random alive enemy in formation mode
-        int indices[MAX_ENEMIES];
-        int n = 0;
-        for (int i = 0; i < MAX_ENEMIES; ++i) {
-            if (enemies[i].alive && enemies[i].mode == 0) {
-                indices[n++] = i;
-            }
-        }
-        if (n > 0) {
-            int idx = indices[irand(0, n - 1)];
-            Enemy* e = &enemies[idx];
-            // set to diving
-            int ex, ey;
-            formation_cell_pos(e->row, e->col, &ex, &ey);
-            e->x = (float)ex;
-            e->y = (float)ey;
-            e->mode = 1;
-            // velocity toward player with downward bias
-            float dx = (float)player_x - e->x;
-            float sgn = (dx > 0) ? 1.0f : (dx < 0 ? -1.0f : 0.0f);
-            e->vx = sgn * (0.15f + 0.03f * (float)wave);
-            e->vy = 0.25f + 0.04f * (float)wave;
-        }
-    }
-}
-
-static void kill_enemy(Enemy* e) {
-    if (e->alive) {
-        e->alive = 0;
-        e->mode = 0;
-        e->expl_timer = 4; // draw a short explosion at their last spot
-        enemies_alive--;
-        score += 50 + 10 * wave;
-    }
-}
-
-static void update_enemies() {
-    // Update formation movement
-    int spacing_x = 6;
-    int spacing_y = 2;
-
-    // Determine leftmost and rightmost cell for current alive enemies
-    int minc = ENEMY_COLS, maxc = -1;
-    for (int i = 0; i < MAX_ENEMIES; ++i) {
-        if (!enemies[i].alive || enemies[i].mode != 0) continue;
-        if (enemies[i].col < minc) minc = enemies[i].col;
-        if (enemies[i].col > maxc) maxc = enemies[i].col;
-    }
-    if (minc == ENEMY_COLS) { // no formation enemies, still move anchor gently
-        form_x += form_dir * form_speed;
-    } else {
-        float left_edge = form_x + minc * spacing_x;
-        float right_edge = form_x + maxc * spacing_x;
-        if (left_edge <= 1) form_dir = 1;
-        if (right_edge >= SCREEN_W - 2) form_dir = -1;
-        form_x += form_dir * form_speed;
-    }
-
-    // Slight vertical bob
-    form_y += (xrnd() % 50 == 0) ? 1.0f : 0.0f;
-    if (form_y > 8.0f) form_y = 4.0f;
-
-    // Launch divers and try firing
-    maybe_launch_diver();
-    try_enemy_fire();
-
-    // Update diving/returning enemies
-    for (int i = 0; i < MAX_ENEMIES; ++i) {
-        Enemy* e = &enemies[i];
-        if (!e->alive) continue;
-        if (e->mode == 1) { // diving
-            // steer slightly toward player
-            float target_vx = (player_x > (int)e->x) ? +fabsf(e->vx) : (player_x < (int)e->x) ? -fabsf(e->vx) : e->vx;
-            // Smooth adjust
-            e->vx = (e->vx * 4.0f + target_vx) / 5.0f;
-            e->x += e->vx;
-            e->y += e->vy;
-
-            // occasional shot while diving
-            if ((xrnd() % 100) < 2) {
-                spawn_ebullet((int)e->x, (int)e->y + 1);
-            }
-
-            // if off bottom, return to formation
-            if ((int)e->y >= SCREEN_H - 2) {
-                e->mode = 2; // returning
-            }
-        } else if (e->mode == 2) { // returning to formation cell
-            int tx, ty;
-            formation_cell_pos(e->row, e->col, &tx, &ty);
-            float dx = (float)tx - e->x;
-            float dy = (float)ty - e->y;
-            float ax = (dx > 0.f) ? 0.3f : (dx < 0.f ? -0.3f : 0.0f);
-            float ay = (dy > 0.f) ? 0.2f : (dy < 0.f ? -0.2f : 0.0f);
-            e->x += ax;
-            e->y += ay;
-            if (abs((int)(e->x - tx)) <= 1 && abs((int)(e->y - ty)) <= 1) {
-                e->mode = 0;
-            }
-        }
-    }
-}
-
-static void update_bullets() {
-    // Player bullets
-    for (int i = 0; i < MAX_PBUL; ++i) {
-        if (!pbul[i].alive) continue;
-        pbul[i].y += pbul[i].dy;
-        if (pbul[i].y < HEADER_H) { pbul[i].alive = 0; continue; }
-        // collision with enemies
-        for (int j = 0; j < MAX_ENEMIES; ++j) {
-            Enemy* e = &enemies[j];
-            if (!e->alive) continue;
-            int ex, ey;
-            if (e->mode == 0) {
-                formation_cell_pos(e->row, e->col, &ex, &ey);
-            } else {
-                ex = (int)e->x; ey = (int)e->y;
-            }
-            if (pbul[i].x == ex && pbul[i].y == ey) {
-                pbul[i].alive = 0;
-                kill_enemy(e);
-                break;
-            }
-        }
-    }
-
-    // Enemy bullets
-    for (int i = 0; i < MAX_EBUL; ++i) {
-        if (!ebul[i].alive) continue;
-        ebul[i].y += ebul[i].dy;
-        if (ebul[i].y >= SCREEN_H - 1) { ebul[i].alive = 0; continue; }
-        // collision with player
-        if (player_inv == 0 && ebul[i].x == player_x && ebul[i].y == player_y) {
-            ebul[i].alive = 0;
-            if (lives > 0) lives--;
-            player_inv = 40; // ~2/3 sec invincibility at 60fps
-            if (lives <= 0) {
-                game_over = 1;
-            }
-        }
-    }
-}
-
-static void update_player(const Input* in) {
-    if (in->left) player_x -= 1;
-    if (in->right) player_x += 1;
-    player_x = clampi(player_x, 1, SCREEN_W - 2);
-
-    if (fire_cooldown > 0) fire_cooldown--;
-    if (in->fire && fire_cooldown == 0) {
-        spawn_pbullet(player_x, player_y - 1);
-        fire_cooldown = 6; // small cooldown
-    }
-}
-
-static void draw_header() {
-    char buf[SCREEN_W + 1];
-    snprintf(buf, sizeof(buf), " SCORE: %06d   LIVES: %d   WAVE: %d   [A/D or ←/→] Move  [Space] Fire  [P] Pause  [Q] Quit", score, lives, wave);
-    draw_text(0, 0, buf);
-    for (int x = 0; x < SCREEN_W; ++x) screen[1][x] = '-';
-}
-
-static void draw_game() {
-    // stars first
-    draw_stars();
-
-    // draw enemies
-    for (int i = 0; i < MAX_ENEMIES; ++i) {
-        Enemy* e = &enemies[i];
-        int ex, ey;
-        if (e->alive) {
-            if (e->mode == 0) {
-                formation_cell_pos(e->row, e->col, &ex, &ey);
-                if (ex >= 0 && ex < SCREEN_W && ey >= HEADER_H && ey < SCREEN_H - 1)
-                    screen[ey][ex] = ENEMY_CHAR;
-            } else if (e->mode == 1 || e->mode == 2) {
-                ex = (int)e->x; ey = (int)e->y;
-                if (ex >= 0 && ex < SCREEN_W && ey >= HEADER_H && ey < SCREEN_H - 1)
-                    screen[ey][ex] = DIVER_CHAR;
-            }
-        } else if (e->expl_timer > 0) {
-            ex = (int)e->x; ey = (int)e->y;
-            e->expl_timer--;
-            if (ex >= 0 && ex < SCREEN_W && ey >= HEADER_H && ey < SCREEN_H - 1)
-                screen[ey][ex] = EXPLO_CHAR;
-        }
-    }
-
-    // draw bullets
-    for (int i = 0; i < MAX_PBUL; ++i)
-        if (pbul[i].alive && pbul[i].y >= HEADER_H && pbul[i].y < SCREEN_H)
-            screen[pbul[i].y][pbul[i].x] = pbul[i].ch;
-    for (int i = 0; i < MAX_EBUL; ++i)
-        if (ebul[i].alive && ebul[i].y >= HEADER_H && ebul[i].y < SCREEN_H)
-            screen[ebul[i].y][ebul[i].x] = ebul[i].ch;
-
-    // draw player
-    if ((player_inv / 4) % 2 == 0 || game_over) { // blink while invincible
-        screen[player_y][player_x] = PLAYER_CHAR;
-    }
-}
-
-static void draw_overlay() {
-    if (paused && !game_over) {
-        const char* t = "PAUSED - Press P to resume";
-        draw_text((SCREEN_W - (int)strlen(t)) / 2, SCREEN_H / 2, t);
-    }
-    if (game_over) {
-        const char* t1 = "GAME OVER";
-        const char* t2 = "Press R to Restart or Q to Quit";
-        draw_text((SCREEN_W - (int)strlen(t1)) / 2, SCREEN_H / 2 - 1, t1);
-        draw_text((SCREEN_W - (int)strlen(t2)) / 2, SCREEN_H / 2 + 1, t2);
-    } else if (enemies_alive == 0) {
-        const char* t1 = "WAVE CLEARED!";
-        const char* t2 = "Get ready...";
-        draw_text((SCREEN_W - (int)strlen(t1)) / 2, SCREEN_H / 2 - 1, t1);
-        draw_text((SCREEN_W - (int)strlen(t2)) / 2, SCREEN_H / 2 + 1, t2);
-    }
-}
-
-static void poll_input(Input* in, Input* prev) {
-    memset(in, 0, sizeof(*in));
-    int c;
-    while ((c = read_key_nonblock()) != -1) {
-        if (c == 'a' || c == 'A' || c == (1000 + 'L')) in->left = 1;
-        if (c == 'd' || c == 'D' || c == (1000 + 'R')) in->right = 1;
-        if (c == ' ') in->fire = 1;
-        if (c == 'q' || c == 'Q') in->quit = 1;
-        if (c == 'p' || c == 'P') in->pause = 1;
-        if (c == 'r' || c == 'R') in->restart = 1;
-    }
-    // allow held keys for move/fire, but treat pause as edge-triggered toggle
-    if (in->pause && !prev->pause) {
-        paused = !paused;
-    }
-}
-
-// -------------------- Main Loop --------------------
-int main(void) {
-    atexit(platform_shutdown);
-    platform_init();
-
-    // Intro
-    clear_screen_full();
-    cursor_home();
-
-    init_stars();
-    reset_bullets();
-    init_enemies();
-
-    double t_prev = now_sec();
-    double accumulator = 0.0;
-    const double dt = 1.0 / 60.0; // 60 FPS
-    Input in = {0}, prev = {0};
-    int post_wave_cooldown = 0;
-
-    while (running) {
-        // Timing
-        double t_now = now_sec();
-        double frame = t_now - t_prev;
-        if (frame > 0.1) frame = 0.1; // clamp
-        t_prev = t_now;
-        accumulator += frame;
-
-        // Input
-        poll_input(&in, &prev);
-        if (in.quit) break;
-
-        // Update at fixed rate
-        while (accumulator >= dt) {
-            accumulator -= dt;
-
-            if (!paused && !game_over) {
-                update_stars();
-                if (player_inv > 0) player_inv--;
-
-                if (enemies_alive == 0) {
-                    if (post_wave_cooldown == 0) post_wave_cooldown = 60;
-                    else {
-                        post_wave_cooldown--;
-                        if (post_wave_cooldown == 0) next_wave();
+void shoot_bullet() {
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (!bullets[i].active) {
+            bullets[i].x = player.x + 3;
+            bullets[i].y = player.y;
+            bullets[i].active = 1;
+            
+            if (player.power_level >= 2) {
+                for (int j = 0; j < MAX_BULLETS; j++) {
+                    if (!bullets[j].active && j != i) {
+                        bullets[j].x = player.x + 3;
+                        bullets[j].y = player.y - 1;
+                        bullets[j].active = 1;
+                        break;
                     }
-                } else {
-                    update_player(&in);
-                    update_bullets();
-                    update_enemies();
                 }
-            } else if (game_over) {
-                // Allow restart
-                if (in.restart) {
-                    reset_game();
+            }
+            break;
+        }
+    }
+}
+
+void spawn_enemy() {
+    if (rand() % 100 < 3) {
+        for (int i = 0; i < MAX_ENEMIES; i++) {
+            if (!enemies[i].active) {
+                enemies[i].x = WIDTH - 2;
+                enemies[i].y = 2 + rand() % (HEIGHT - 4);
+                enemies[i].type = rand() % 3;
+                enemies[i].health = enemies[i].type + 1;
+                enemies[i].speed = 0.1f + (rand() % 10) / 20.0f;
+                enemies[i].shoot_timer = 0;
+                enemies[i].active = 1;
+                break;
+            }
+        }
+    }
+}
+
+void spawn_powerup(float x, float y) {
+    for (int i = 0; i < MAX_POWERUPS; i++) {
+        if (!powerups[i].active) {
+            powerups[i].x = x;
+            powerups[i].y = y;
+            powerups[i].type = rand() % 2;
+            powerups[i].active = 1;
+            break;
+        }
+    }
+}
+
+void update_bullets() {
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (bullets[i].active) {
+            bullets[i].x += 1.5f;
+            if (bullets[i].x >= WIDTH - 1) {
+                bullets[i].active = 0;
+            }
+        }
+    }
+    
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (enemy_bullets[i].active) {
+            enemy_bullets[i].x -= 0.8f;
+            if (enemy_bullets[i].x <= 0) {
+                enemy_bullets[i].active = 0;
+            }
+            
+            if (!player.invincible &&
+                (int)enemy_bullets[i].x >= (int)player.x && 
+                (int)enemy_bullets[i].x <= (int)player.x + 2 &&
+                (int)enemy_bullets[i].y >= (int)player.y - 1 && 
+                (int)enemy_bullets[i].y <= (int)player.y + 1) {
+                player.lives--;
+                player.invincible = 60;
+                enemy_bullets[i].active = 0;
+                for (int j = 0; j < 10; j++) {
+                    add_particle(player.x, player.y, '*');
+                }
+                if (player.lives <= 0) game_over = 1;
+            }
+        }
+    }
+}
+
+void update_enemies() {
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (enemies[i].active) {
+            enemies[i].x -= enemies[i].speed;
+            
+            if (enemies[i].type == 1) {
+                enemies[i].y += 0.1f * ((frame % 60) < 30 ? 1 : -1);
+            }
+            
+            enemies[i].shoot_timer++;
+            if (enemies[i].shoot_timer > 40 && rand() % 100 < 5) {
+                for (int j = 0; j < MAX_BULLETS; j++) {
+                    if (!enemy_bullets[j].active) {
+                        enemy_bullets[j].x = enemies[i].x;
+                        enemy_bullets[j].y = enemies[i].y;
+                        enemy_bullets[j].active = 1;
+                        enemies[i].shoot_timer = 0;
+                        break;
+                    }
+                }
+            }
+            
+            if (enemies[i].x < 0) {
+                enemies[i].active = 0;
+            }
+            
+            if (!player.invincible &&
+                (int)enemies[i].x >= (int)player.x && 
+                (int)enemies[i].x <= (int)player.x + 2 &&
+                (int)enemies[i].y == (int)player.y) {
+                player.lives--;
+                player.invincible = 60;
+                enemies[i].active = 0;
+                for (int j = 0; j < 15; j++) {
+                    add_particle(enemies[i].x, enemies[i].y, '#');
+                }
+                if (player.lives <= 0) game_over = 1;
+            }
+        }
+    }
+}
+
+void update_powerups() {
+    for (int i = 0; i < MAX_POWERUPS; i++) {
+        if (powerups[i].active) {
+            powerups[i].x -= 0.3f;
+            
+            if (powerups[i].x < 0) {
+                powerups[i].active = 0;
+            }
+            
+            if ((int)powerups[i].x >= (int)player.x && 
+                (int)powerups[i].x <= (int)player.x + 2 &&
+                (int)powerups[i].y == (int)player.y) {
+                if (powerups[i].type == 0) {
+                    player.power_level = (player.power_level < 5) ? player.power_level + 1 : 5;
+                } else {
+                    player.score += 100;
+                }
+                powerups[i].active = 0;
+                for (int j = 0; j < 5; j++) {
+                    add_particle(powerups[i].x, powerups[i].y, '+');
                 }
             }
         }
-
-        // Render
-        clear_screen_buffer();
-        draw_header();
-        draw_game();
-        draw_overlay();
-        present_screen();
-
-        prev = in;
-        sleep_ms(6); // small sleep to reduce CPU usage
     }
+}
 
-    // Cleanup
-    platform_shutdown();
+void update_particles() {
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (particles[i].active) {
+            particles[i].life--;
+            particles[i].x += (rand() % 3 - 1) * 0.5f;
+            particles[i].y += (rand() % 3 - 1) * 0.3f;
+            if (particles[i].life <= 0) {
+                particles[i].active = 0;
+            }
+        }
+    }
+}
+
+void check_collisions() {
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (bullets[i].active) {
+            for (int j = 0; j < MAX_ENEMIES; j++) {
+                if (enemies[j].active &&
+                    (int)bullets[i].x == (int)enemies[j].x &&
+                    (int)bullets[i].y == (int)enemies[j].y) {
+                    bullets[i].active = 0;
+                    enemies[j].health--;
+                    
+                    add_particle(enemies[j].x, enemies[j].y, '*');
+                    
+                    if (enemies[j].health <= 0) {
+                        player.score += (enemies[j].type + 1) * 10;
+                        for (int k = 0; k < 10; k++) {
+                            add_particle(enemies[j].x, enemies[j].y, '#');
+                        }
+                        if (rand() % 100 < 30) {
+                            spawn_powerup(enemies[j].x, enemies[j].y);
+                        }
+                        enemies[j].active = 0;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void render() {
+    memset(screen, ' ', sizeof(screen));
+    
+    for (int y = 0; y < HEIGHT; y++) {
+        if ((frame / 2 + y) % 4 == 0) {
+            screen[y][(frame / 2) % WIDTH] = '.';
+        }
+        if ((frame / 3 + y) % 7 == 0) {
+            screen[y][(frame / 3) % WIDTH] = ':';
+        }
+    }
+    
+    char ship[3][4] = {
+        " ^ ",
+        "=>)",
+        " v "
+    };
+    
+    if ((int)player.y - 1 >= 0 && (int)player.y + 1 < HEIGHT) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = 0; dx < 3; dx++) {
+                int px = (int)player.x + dx;
+                int py = (int)player.y + dy;
+                if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
+                    if (player.invincible && (frame % 6) < 3) {
+                        screen[py][px] = ' ';
+                    } else {
+                        screen[py][px] = ship[dy + 1][dx];
+                    }
+                }
+            }
+        }
+    }
+    
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (bullets[i].active) {
+            int x = (int)bullets[i].x;
+            int y = (int)bullets[i].y;
+            if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+                screen[y][x] = '-';
+            }
+        }
+    }
+    
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (enemy_bullets[i].active) {
+            int x = (int)enemy_bullets[i].x;
+            int y = (int)enemy_bullets[i].y;
+            if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+                screen[y][x] = '~';
+            }
+        }
+    }
+    
+    char enemy_chars[] = {'o', '@', 'X'};
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (enemies[i].active) {
+            int x = (int)enemies[i].x;
+            int y = (int)enemies[i].y;
+            if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+                screen[y][x] = enemy_chars[enemies[i].type];
+            }
+        }
+    }
+    
+    for (int i = 0; i < MAX_POWERUPS; i++) {
+        if (powerups[i].active) {
+            int x = (int)powerups[i].x;
+            int y = (int)powerups[i].y;
+            if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+                screen[y][x] = powerups[i].type == 0 ? 'P' : '$';
+            }
+        }
+    }
+    
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (particles[i].active) {
+            int x = (int)particles[i].x;
+            int y = (int)particles[i].y;
+            if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+                screen[y][x] = particles[i].c;
+            }
+        }
+    }
+    
+    printf("\033[H");
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            char c = screen[y][x];
+            if (c == '^' || c == 'v' || c == '>' || c == ')' || c == '=') {
+                printf("\033[36m%c\033[0m", c);
+            } else if (c == '-') {
+                printf("\033[33m%c\033[0m", c);
+            } else if (c == 'o' || c == '@' || c == 'X') {
+                printf("\033[31m%c\033[0m", c);
+            } else if (c == '~') {
+                printf("\033[35m%c\033[0m", c);
+            } else if (c == 'P') {
+                printf("\033[32m%c\033[0m", c);
+            } else if (c == '$') {
+                printf("\033[33m%c\033[0m", c);
+            } else if (c == '*' || c == '#' || c == '+') {
+                printf("\033[37m%c\033[0m", c);
+            } else {
+                printf("%c", c);
+            }
+        }
+        printf("\n");
+    }
+    
+    printf("\033[33mScore: %d  Lives: %d  Power: %d\033[0m", 
+           player.score, player.lives, player.power_level);
+    fflush(stdout);
+}
+
+int main() {
+    enable_raw_mode();
+    clear_screen();
+    printf("\033[?25l");
+    
+    init_game();
+    
+    char input;
+    int shoot_cooldown = 0;
+    
+    printf("\033[H\033[2J");
+    printf("\n\n");
+    printf("  ╔═══════════════════════════════════════╗\n");
+    printf("  ║     GRADIUS-STYLE SPACE SHOOTER      ║\n");
+    printf("  ╠═══════════════════════════════════════╣\n");
+    printf("  ║                                       ║\n");
+    printf("  ║  Controls:                            ║\n");
+    printf("  ║    W/A/S/D - Move                     ║\n");
+    printf("  ║    SPACE   - Shoot                    ║\n");
+    printf("  ║    Q       - Quit                     ║\n");
+    printf("  ║                                       ║\n");
+    printf("  ║  Collect P for power-ups!             ║\n");
+    printf("  ║  Collect $ for bonus points!          ║\n");
+    printf("  ║                                       ║\n");
+    printf("  ║  Press SPACE to start...              ║\n");
+    printf("  ║                                       ║\n");
+    printf("  ╚═══════════════════════════════════════╝\n");
+    
+    while (read(STDIN_FILENO, &input, 1) == 1) {
+        if (input == ' ') break;
+        if (input == 'q') {
+            printf("\033[?25h\033[2J\033[H");
+            return 0;
+        }
+    }
+    
+    clear_screen();
+    
+    while (!game_over) {
+        if (read(STDIN_FILENO, &input, 1) == 1) {
+            switch (input) {
+                case 'w': if (player.y > 1) player.y -= 1; break;
+                case 's': if (player.y < HEIGHT - 2) player.y += 1; break;
+                case 'a': if (player.x > 1) player.x -= 1; break;
+                case 'd': if (player.x < WIDTH - 5) player.x += 1; break;
+                case ' ': 
+                    if (shoot_cooldown <= 0) {
+                        shoot_bullet();
+                        shoot_cooldown = 8 - player.power_level;
+                    }
+                    break;
+                case 'q': game_over = 1; break;
+            }
+        }
+        
+        if (shoot_cooldown > 0) shoot_cooldown--;
+        if (player.invincible > 0) player.invincible--;
+        
+        spawn_enemy();
+        update_bullets();
+        update_enemies();
+        update_powerups();
+        update_particles();
+        check_collisions();
+        
+        render();
+        
+        frame++;
+        usleep(33333);
+    }
+    
+    printf("\033[?25h");
+    printf("\n\n  GAME OVER! Final Score: %d\n\n", player.score);
+    
     return 0;
 }
