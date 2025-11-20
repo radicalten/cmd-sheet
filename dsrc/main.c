@@ -1,175 +1,172 @@
-/*
- * Single File Terminal Song (Tetris Theme / Korobeiniki)
- * 
- * COMPILATION:
- *   Linux/macOS:  gcc tetris.c -o tetris
- *   Windows:      cl tetris.c (or gcc tetris.c -o tetris.exe)
- *
- * DEPENDENCIES:
- *   Linux: Requires 'aplay' (part of alsa-utils, installed on almost all distros)
- *   Windows: No dependencies (uses built-in windows.h)
- *   macOS: Requires 'sox' installed (brew install sox) used as 'play' command. 
- *          (Native macOS audio via C without frameworks is extremely complex).
- */
+// song.c
+// Single-file C program that generates and plays a melody on macOS.
+// Compile: clang song.c -o song -std=c11 -Wall -Wextra
+// Run:     ./song
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <math.h>
 
-// Platform detection
-#ifdef _WIN32
-    #include <windows.h>
-    #define IS_WINDOWS 1
-#else
-    #include <unistd.h>
-    #define IS_WINDOWS 0
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
 
-// Audio Settings
-#define SAMPLE_RATE 8000
+#define SAMPLE_RATE 44100
+#define AMPLITUDE   0.4     // 0.0 to 1.0
+#define GAP_SECONDS 0.02    // silence between notes
 
-// Note Frequencies (Hz)
-#define REST 0
-#define G3   196
-#define GS3  208
-#define A3   220
-#define B3   247
-#define C4   262
-#define D4   294
-#define E4   330
-#define F4   349
-#define FS4  370
-#define G4   392
-#define GS4  415
-#define A4   440
-#define B4   494
-#define C5   523
-#define D5   587
-#define E5   659
-#define F5   698
-#define G5   784
-#define A5   880
-
-// Note Duration Multipliers
-#define Q 1.0  // Quarter
-#define H 2.0  // Half
-#define E 0.5  // Eighth
-#define S 0.25 // Sixteenth
-
-// The Song Data (Frequency, Duration Multiplier)
-// Tetris Theme (Korobeiniki)
 typedef struct {
-    int freq;
-    float duration;
+    double freq;     // Hz, 0.0 = rest
+    double duration; // seconds
 } Note;
 
-Note song[] = {
-    {E5, Q}, {B4, E}, {C5, E}, {D5, Q}, {C5, E}, {B4, E},
-    {A4, Q}, {A4, E}, {C5, E}, {E5, Q}, {D5, E}, {C5, E},
-    {B4, Q}, {B4, E}, {C5, E}, {D5, Q}, {E5, Q},
-    {C5, Q}, {A4, Q}, {A4, Q}, {REST, Q},
-    
-    {D5, Q}, {F5, E}, {A5, Q}, {G5, E}, {F5, E},
-    {E5, Q}, {C5, E}, {E5, Q}, {D5, E}, {C5, E},
-    {B4, Q}, {B4, E}, {C5, E}, {D5, Q}, {E5, Q},
-    {C5, Q}, {A4, Q}, {A4, Q}, {REST, Q},
-
-    // End of loop signal
-    { -1, -1 } 
-};
-
-// Global file pointer for the pipe (Linux/Unix only)
-FILE *audio_pipe = NULL;
-
-void init_audio() {
-    if (!IS_WINDOWS) {
-        // On Linux, we pipe raw audio data to 'aplay'
-        // -t raw: raw data
-        // -r: sample rate
-        // -f U8: Unsigned 8-bit format
-        // -c 1: Mono
-        
-        // Try opening aplay (Linux standard)
-        audio_pipe = popen("aplay -t raw -r 8000 -f U8 -c 1 -q 2>/dev/null", "w");
-        
-        // If aplay failed, try 'play' (SoX - common on macOS/Linux)
-        if (!audio_pipe) {
-            audio_pipe = popen("play -t raw -r 8000 -b 8 -c 1 -e unsigned-integer - -q 2>/dev/null", "w");
-        }
-        
-        if (!audio_pipe) {
-            printf("Error: Could not find 'aplay' or 'sox'. Audio might not play.\n");
-        }
-    }
+static void write_u32_le(FILE *f, uint32_t v) {
+    unsigned char b[4];
+    b[0] = (unsigned char)(v & 0xFF);
+    b[1] = (unsigned char)((v >> 8) & 0xFF);
+    b[2] = (unsigned char)((v >> 16) & 0xFF);
+    b[3] = (unsigned char)((v >> 24) & 0xFF);
+    fwrite(b, 1, 4, f);
 }
 
-void close_audio() {
-    if (!IS_WINDOWS && audio_pipe) {
-        pclose(audio_pipe);
-    }
+static void write_u16_le(FILE *f, uint16_t v) {
+    unsigned char b[2];
+    b[0] = (unsigned char)(v & 0xFF);
+    b[1] = (unsigned char)((v >> 8) & 0xFF);
+    fwrite(b, 1, 2, f);
 }
 
-// Synthesize and play a tone
-void play_tone(int freq, float duration_mult) {
-    int base_ms = 500; // Tempo: Length of a quarter note in ms
-    int duration_ms = (int)(base_ms * duration_mult);
+static void write_sample(FILE *f, double value) {
+    if (value > 1.0)  value = 1.0;
+    if (value < -1.0) value = -1.0;
+    int16_t s = (int16_t)(value * 32767.0);
+    fwrite(&s, sizeof(s), 1, f);
+}
 
-    // Visualizer
-    if(freq != REST) {
-        printf("Playing: %d Hz \r", freq);
-        fflush(stdout);
-    } else {
-        printf("...Rest...     \r");
-        fflush(stdout);
+int main(void) {
+    // Frequencies for C4 major scale
+    const double C4 = 261.63;
+    const double D4 = 293.66;
+    const double E4 = 329.63;
+    const double F4 = 349.23;
+    const double G4 = 392.00;
+    const double A4 = 440.00;
+
+    // "Twinkle Twinkle Little Star" (first two phrases)
+    Note melody[] = {
+        {C4, 0.5}, {C4, 0.5}, {G4, 0.5}, {G4, 0.5},
+        {A4, 0.5}, {A4, 0.5}, {G4, 1.0},
+
+        {F4, 0.5}, {F4, 0.5}, {E4, 0.5}, {E4, 0.5},
+        {D4, 0.5}, {D4, 0.5}, {C4, 1.0},
+    };
+    const size_t melody_len = sizeof(melody) / sizeof(melody[0]);
+
+    const char *filename = "song_tmp.wav";
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        perror("fopen");
+        return 1;
     }
 
-    if (IS_WINDOWS) {
-        if (freq > 0) {
-            Beep(freq, duration_ms);
-        } else {
-            Sleep(duration_ms);
-        }
-    } else {
-        // Unix Audio Synthesis (Square Wave)
-        if (audio_pipe) {
-            int total_samples = (SAMPLE_RATE * duration_ms) / 1000;
-            
-            for (int i = 0; i < total_samples; i++) {
-                unsigned char sample;
-                if (freq == 0) {
-                    sample = 128; // Silence (midpoint of U8)
-                } else {
-                    // Generate Square Wave
-                    // We switch between 0 (low) and 255 (high) based on the frequency period
-                    int period = SAMPLE_RATE / freq;
-                    int half_period = period / 2;
-                    sample = ((i / half_period) % 2) ? 200 : 55; // Volume slightly reduced from max
-                }
-                fputc(sample, audio_pipe);
+    // Reserve space for 44-byte WAV header (we'll fill it in later)
+    unsigned char header[44] = {0};
+    if (fwrite(header, 1, 44, f) != 44) {
+        perror("fwrite header placeholder");
+        fclose(f);
+        return 1;
+    }
+
+    size_t total_samples = 0;
+
+    for (size_t n = 0; n < melody_len; ++n) {
+        Note note = melody[n];
+        int note_samples = (int)(note.duration * SAMPLE_RATE);
+        if (note_samples < 1) note_samples = 1;
+
+        int gap_samples = (int)(GAP_SECONDS * SAMPLE_RATE);
+
+        if (note.freq > 0.0) {
+            double phase = 0.0;
+            double phase_inc = 2.0 * M_PI * note.freq / (double)SAMPLE_RATE;
+
+            // Simple fade-in/out to avoid clicks
+            int attack = SAMPLE_RATE * 0.01;  // 10 ms
+            int release = attack;
+            if (attack + release > note_samples) {
+                attack = note_samples / 2;
+                release = note_samples - attack;
             }
-            // Flush to ensure timing stays roughly accurate
-            fflush(audio_pipe); 
+
+            for (int i = 0; i < note_samples; ++i) {
+                double env = 1.0;
+                if (i < attack) {
+                    env = (double)i / (double)attack;
+                } else if (i > note_samples - release) {
+                    env = (double)(note_samples - i) / (double)release;
+                }
+
+                double sample = sin(phase) * AMPLITUDE * env;
+                phase += phase_inc;
+                write_sample(f, sample);
+                total_samples++;
+            }
         } else {
-            // Fallback if no audio backend found: just wait
-            usleep(duration_ms * 1000);
+            // Rest: write silence
+            for (int i = 0; i < note_samples; ++i) {
+                write_sample(f, 0.0);
+                total_samples++;
+            }
+        }
+
+        // Gap (silence) between notes
+        for (int i = 0; i < gap_samples; ++i) {
+            write_sample(f, 0.0);
+            total_samples++;
         }
     }
-}
 
-int main() {
-    printf("=== C Terminal Synth ===\n");
-    printf("Playing: Tetris Theme\n");
-    
-    init_audio();
+    // Now fill in the WAV header
+    uint32_t data_size = (uint32_t)(total_samples * sizeof(int16_t));
+    uint32_t chunk_size = 36 + data_size;
+    uint16_t audio_format = 1;      // PCM
+    uint16_t num_channels = 1;      // mono
+    uint16_t bits_per_sample = 16;
+    uint32_t byte_rate = SAMPLE_RATE * num_channels * bits_per_sample / 8;
+    uint16_t block_align = num_channels * bits_per_sample / 8;
 
-    int i = 0;
-    while (song[i].freq != -1) {
-        play_tone(song[i].freq, song[i].duration);
-        // A tiny gap between notes makes it sound more distinct
-        if (!IS_WINDOWS) play_tone(REST, 0.05); 
-        i++;
+    rewind(f);
+
+    // RIFF header
+    fwrite("RIFF", 1, 4, f);
+    write_u32_le(f, chunk_size);
+    fwrite("WAVE", 1, 4, f);
+
+    // fmt subchunk
+    fwrite("fmt ", 1, 4, f);
+    write_u32_le(f, 16); // Subchunk1Size for PCM
+    write_u16_le(f, audio_format);
+    write_u16_le(f, num_channels);
+    write_u32_le(f, SAMPLE_RATE);
+    write_u32_le(f, byte_rate);
+    write_u16_le(f, block_align);
+    write_u16_le(f, bits_per_sample);
+
+    // data subchunk
+    fwrite("data", 1, 4, f);
+    write_u32_le(f, data_size);
+
+    fclose(f);
+
+    // Use macOS's built-in 'afplay' to play the WAV file
+    int ret = system("afplay song_tmp.wav");
+    if (ret == -1) {
+        perror("system(afplay)");
     }
 
-    close_audio();
-    printf("\nDone!\n");
+    // Clean up temporary file
+    remove(filename);
+
     return 0;
 }
