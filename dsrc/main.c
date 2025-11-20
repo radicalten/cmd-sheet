@@ -1,93 +1,78 @@
-/*
- * song.c - Single-file, dependency-free C "song" player for the terminal.
- *
- * It uses only the C standard library (stdio.h, time.h) and the terminal
- * bell character '\a'. Because standard C has no sound API, this program
- * plays a rhythm using repeated beeps (no control over pitch).
- *
- * Compile:
- *   cc song.c -o song      (or gcc/clang)
- *
- * Run:
- *   ./song
- *
- * If your terminal/system bell is disabled, you may not hear anything.
- */
-
 #include <stdio.h>
-#include <time.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 
-typedef struct {
-    int is_rest;      /* 0 = beep, 1 = silence */
-    int duration_ms;  /* duration in milliseconds */
-} Beat;
+// For Linux PC speaker control
+#define KIOCSOUND 0x4B2F
 
-/* Busy-wait sleep using only standard C clock().
-   This burns CPU but keeps the program fully portable. */
-static void sleep_ms(int ms)
-{
-    clock_t start = clock();
-    /* convert ms to clock ticks using double to avoid truncation issues */
-    clock_t wait_ticks = (clock_t)((double)ms * (double)CLOCKS_PER_SEC / 1000.0);
+// Note frequencies (Hz)
+#define C4  262
+#define D4  294
+#define E4  330
+#define F4  349
+#define G4  392
+#define A4  440
+#define B4  494
+#define C5  523
+#define REST 0
 
-    while ((clock() - start) < wait_ticks) {
-        /* busy wait */
+void play_tone(int fd, int freq, int duration_ms) {
+    if (freq > 0) {
+        ioctl(fd, KIOCSOUND, 1193180 / freq);
     }
+    usleep(duration_ms * 1000);
+    ioctl(fd, KIOCSOUND, 0);
+    usleep(30000); // Brief pause between notes
 }
 
-/* Play one beat: either beep or rest for the given duration. */
-static void play_beat(Beat b)
-{
-    if (!b.is_rest) {
-        putchar('\a');      /* terminal bell */
-        fflush(stdout);
+int main() {
+    printf("🎵 Playing: Twinkle Twinkle Little Star 🎵\n\n");
+    
+    int fd = open("/dev/tty", O_WRONLY);
+    if (fd == -1) {
+        fd = open("/dev/console", O_WRONLY);
     }
-    sleep_ms(b.duration_ms);
-}
-
-int main(void)
-{
-    /* Twinkle Twinkle Little Star rhythm (no pitch, just timing).
-       Q = quarter note duration in milliseconds. */
-    const int Q = 300;
-
-    Beat song[] = {
-        /* C  C  G  G  A  A  G  - */
-        {0, Q}, {0, Q}, {0, Q}, {0, Q},
-        {0, Q}, {0, Q}, {0, 2*Q},
-
-        /* F  F  E  E  D  D  C  - */
-        {0, Q}, {0, Q}, {0, Q}, {0, Q},
-        {0, Q}, {0, Q}, {0, 2*Q},
-
-        /* G  G  F  F  E  E  D  - */
-        {0, Q}, {0, Q}, {0, Q}, {0, Q},
-        {0, Q}, {0, Q}, {0, 2*Q},
-
-        /* G  G  F  F  E  E  D  - */
-        {0, Q}, {0, Q}, {0, Q}, {0, Q},
-        {0, Q}, {0, Q}, {0, 2*Q},
-
-        /* C  C  G  G  A  A  G  - */
-        {0, Q}, {0, Q}, {0, Q}, {0, Q},
-        {0, Q}, {0, Q}, {0, 2*Q},
-
-        /* F  F  E  E  D  D  C  - */
-        {0, Q}, {0, Q}, {0, Q}, {0, Q},
-        {0, Q}, {0, Q}, {0, 2*Q},
+    
+    if (fd == -1) {
+        printf("❌ Cannot access speaker. Try running with: sudo ./song\n");
+        printf("📝 Showing visual music instead:\n\n");
+        // Fallback: visual representation
+        char *notes[] = {"C", "C", "G", "G", "A", "A", "G", "F", "F", "E", "E", "D", "D", "C"};
+        for (int i = 0; i < 14; i++) {
+            printf("♪ %s ", notes[i]);
+            fflush(stdout);
+            usleep(500000);
+        }
+        printf("\n");
+        return 1;
+    }
+    
+    // Twinkle Twinkle Little Star
+    int song[][2] = {
+        {C4, 500}, {C4, 500}, {G4, 500}, {G4, 500},
+        {A4, 500}, {A4, 500}, {G4, 1000},
+        {F4, 500}, {F4, 500}, {E4, 500}, {E4, 500},
+        {D4, 500}, {D4, 500}, {C4, 1000}
     };
-
-    int num_beats = (int)(sizeof(song) / sizeof(song[0]));
-    int i;
-
-    printf("Playing song (if your terminal bell is enabled)...\n");
-
-    for (i = 0; i < num_beats; ++i) {
-        play_beat(song[i]);
-        /* small gap between beats so they don't run together */
-        sleep_ms(40);
+    
+    char *lyrics[] = {
+        "Twin", "kle", "twin", "kle",
+        "lit", "tle", "star",
+        "How", "I", "won", "der",
+        "what", "you", "are"
+    };
+    
+    int num_notes = sizeof(song) / sizeof(song[0]);
+    
+    for (int i = 0; i < num_notes; i++) {
+        printf("♪ %s ", lyrics[i]);
+        fflush(stdout);
+        play_tone(fd, song[i][0], song[i][1]);
     }
-
-    printf("\nDone.\n");
+    
+    printf("\n\n✨ Done! ✨\n");
+    close(fd);
     return 0;
 }
