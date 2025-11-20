@@ -1,101 +1,144 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
-#include <unistd.h>
 
 #define SAMPLE_RATE 44100
-#define AMPLITUDE 10000
+#define VOLUME 0.5
+#define TEMP_FILE "/tmp/mac_terminal_song.wav"
+
+// Note Frequencies (Hz)
+#define REST 0.00
+#define G3   196.00
+#define A3   220.00
+#define B3   246.94
+#define C4   261.63
+#define D4   293.66
+#define E4   329.63
+#define F4   349.23
+#define G4   392.00
+#define GS4  415.30
+#define A4   440.00
+#define B4   493.88
+#define C5   523.25
+#define D5   587.33
+#define E5   659.25
 
 typedef struct {
-    char riff[4];
-    int size;
-    char wave[4];
-    char fmt[4];
-    int fmt_size;
-    short audio_format;
-    short num_channels;
-    int sample_rate;
-    int byte_rate;
-    short block_align;
-    short bits_per_sample;
-    char data[4];
-    int data_size;
-} WAVHeader;
+    double freq;
+    int duration_ms;
+} Note;
 
-void write_wav_header(FILE *f, int num_samples) {
-    WAVHeader header;
+// WAV Header Structure
+typedef struct {
+    char riff[4];           // "RIFF"
+    uint32_t overall_size;  // File size - 8
+    char wave[4];           // "WAVE"
+    char fmt_chunk_marker[4]; // "fmt "
+    uint32_t length_of_fmt; // 16
+    uint16_t format_type;   // 1 (PCM)
+    uint16_t channels;      // 1
+    uint32_t sample_rate;   // 44100
+    uint32_t byterate;      // sample_rate * bits_per_sample * channels / 8
+    uint16_t block_align;   // bits_per_sample * channels / 8
+    uint16_t bits_per_sample;// 16
+    char data_chunk_header[4];// "data"
+    uint32_t data_size;     // data size
+} WavHeader;
+
+void write_wav_header(FILE *file, uint32_t total_samples) {
+    WavHeader header;
+    uint32_t data_sz = total_samples * sizeof(int16_t);
+
     memcpy(header.riff, "RIFF", 4);
+    header.overall_size = 36 + data_sz;
     memcpy(header.wave, "WAVE", 4);
-    memcpy(header.fmt, "fmt ", 4);
-    memcpy(header.data, "data", 4);
-    
-    header.fmt_size = 16;
-    header.audio_format = 1;
-    header.num_channels = 1;
+    memcpy(header.fmt_chunk_marker, "fmt ", 4);
+    header.length_of_fmt = 16;
+    header.format_type = 1; // PCM
+    header.channels = 1;    // Mono
     header.sample_rate = SAMPLE_RATE;
     header.bits_per_sample = 16;
-    header.byte_rate = SAMPLE_RATE * header.num_channels * header.bits_per_sample / 8;
-    header.block_align = header.num_channels * header.bits_per_sample / 8;
-    header.data_size = num_samples * header.num_channels * header.bits_per_sample / 8;
-    header.size = 36 + header.data_size;
-    
-    fwrite(&header, sizeof(WAVHeader), 1, f);
-}
+    header.block_align = header.channels * header.bits_per_sample / 8;
+    header.byterate = header.sample_rate * header.block_align;
+    memcpy(header.data_chunk_header, "data", 4);
+    header.data_size = data_sz;
 
-void add_tone(FILE *f, double freq, double duration) {
-    int num_samples = (int)(SAMPLE_RATE * duration);
-    for (int i = 0; i < num_samples; i++) {
-        double t = (double)i / SAMPLE_RATE;
-        short sample = (short)(AMPLITUDE * sin(2.0 * M_PI * freq * t));
-        fwrite(&sample, sizeof(short), 1, f);
-    }
+    fwrite(&header, sizeof(WavHeader), 1, file);
 }
 
 int main() {
-    const char *filename = "/tmp/song.wav";
-    FILE *f = fopen(filename, "wb");
-    
+    printf("Generating audio...\n");
+
+    FILE *f = fopen(TEMP_FILE, "wb");
     if (!f) {
-        printf("Error creating audio file\n");
+        fprintf(stderr, "Error: Could not open temporary file for writing.\n");
         return 1;
     }
+
+    // Tetris Theme (Korobeiniki) Data
+    // Speed modifier (lower is faster)
+    int s = 220; 
     
-    // Note frequencies
-    double C = 261.63, D = 293.66, E = 329.63, F = 349.23;
-    double G = 392.00, A = 440.00, rest = 0.0;
-    double beat = 0.3;
-    
-    // Reserve space for header
-    fseek(f, sizeof(WAVHeader), SEEK_SET);
-    
-    // Twinkle Twinkle Little Star melody
-    double notes[] = {C,C,G,G,A,A,G,rest, F,F,E,E,D,D,C,rest,
-                      G,G,F,F,E,E,D,rest, G,G,F,F,E,E,D,rest,
-                      C,C,G,G,A,A,G,rest, F,F,E,E,D,D,C,rest};
-    
-    printf("🎵 Playing: Twinkle Twinkle Little Star 🎵\n");
-    
-    for (int i = 0; i < sizeof(notes)/sizeof(notes[0]); i++) {
-        if (notes[i] > 0) {
-            add_tone(f, notes[i], beat);
-        } else {
-            add_tone(f, 0, beat * 0.5);
+    Note melody[] = {
+        {E5, 2*s}, {B4, s}, {C5, s}, {D5, 2*s}, {C5, s}, {B4, s},
+        {A4, 2*s}, {A4, s}, {C5, s}, {E5, 2*s}, {D5, s}, {C5, s},
+        {B4, 3*s}, {C5, s}, {D5, 2*s}, {E5, 2*s},
+        {C5, 2*s}, {A4, 2*s}, {A4, 2*s}, {REST, s}, {REST, s},
+        // Section B
+        {D5, 3*s}, {F4, s}, {A5, 2*s}, {G5, s}, {F5, s},
+        {E5, 3*s}, {C5, s}, {E5, 2*s}, {D5, s}, {C5, s},
+        {B4, 2*s}, {B4, s}, {C5, s}, {D5, 2*s}, {E5, 2*s},
+        {C5, 2*s}, {A4, 2*s}, {A4, 2*s}, {REST, 2*s}
+    };
+
+    int note_count = sizeof(melody) / sizeof(Note);
+    uint32_t total_samples = 0;
+
+    // Placeholder for header (we will overwrite later with correct size)
+    WavHeader empty_header = {0};
+    fwrite(&empty_header, sizeof(WavHeader), 1, f);
+
+    // Generate Audio
+    for (int i = 0; i < note_count; i++) {
+        double freq = melody[i].freq;
+        int samples_n = (int)((melody[i].duration_ms / 1000.0) * SAMPLE_RATE);
+        total_samples += samples_n;
+
+        for (int t = 0; t < samples_n; t++) {
+            int16_t sample_val = 0;
+            if (freq > 0) {
+                // Sine wave formula
+                double time = (double)t / SAMPLE_RATE;
+                double val = sin(2.0 * M_PI * freq * time);
+
+                // Simple Envelope (Fade in/out to prevent clicking)
+                double envelope = 1.0;
+                if (t < 500) envelope = t / 500.0; // Attack
+                if (t > samples_n - 500) envelope = (samples_n - t) / 500.0; // Release
+                
+                sample_val = (int16_t)(val * 32767 * VOLUME * envelope);
+            }
+            fwrite(&sample_val, sizeof(int16_t), 1, f);
         }
     }
-    
-    int num_samples = (ftell(f) - sizeof(WAVHeader)) / sizeof(short);
-    fseek(f, 0, SEEK_SET);
-    write_wav_header(f, num_samples);
+
+    // Go back to start and write real header with calculated size
+    rewind(f);
+    write_wav_header(f, total_samples);
     fclose(f);
+
+    printf("Playing song (Tetris Theme)...\n");
     
-    // Play the file using macOS's built-in afplay
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "afplay %s", filename);
-    system(cmd);
-    
+    // Use macOS built-in audio player
+    char command[256];
+    snprintf(command, sizeof(command), "afplay %s", TEMP_FILE);
+    system(command);
+
     // Cleanup
-    unlink(filename);
-    
+    remove(TEMP_FILE);
+    printf("Done.\n");
+
     return 0;
 }
