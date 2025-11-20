@@ -1,73 +1,93 @@
+/*
+ * song.c - Single-file, dependency-free C "song" player for the terminal.
+ *
+ * It uses only the C standard library (stdio.h, time.h) and the terminal
+ * bell character '\a'. Because standard C has no sound API, this program
+ * plays a rhythm using repeated beeps (no control over pitch).
+ *
+ * Compile:
+ *   cc song.c -o song      (or gcc/clang)
+ *
+ * Run:
+ *   ./song
+ *
+ * If your terminal/system bell is disabled, you may not hear anything.
+ */
+
 #include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <linux/kd.h>
-
-// Note frequencies (Hz)
-#define C4  262
-#define D4  294
-#define E4  330
-#define F4  349
-#define G4  392
-#define A4  440
-#define B4  494
-#define C5  523
-#define REST 0
-
-// Duration (microseconds)
-#define QUARTER 400000
-#define HALF    800000
-#define WHOLE   1600000
+#include <time.h>
 
 typedef struct {
-    int freq;
-    int duration;
-} Note;
+    int is_rest;      /* 0 = beep, 1 = silence */
+    int duration_ms;  /* duration in milliseconds */
+} Beat;
 
-void play_note(int fd, int freq, int duration) {
-    if (freq > 0) {
-        ioctl(fd, KIOCSOUND, 1193180 / freq);
-        usleep(duration);
-        ioctl(fd, KIOCSOUND, 0);
-    } else {
-        usleep(duration);
+/* Busy-wait sleep using only standard C clock().
+   This burns CPU but keeps the program fully portable. */
+static void sleep_ms(int ms)
+{
+    clock_t start = clock();
+    /* convert ms to clock ticks using double to avoid truncation issues */
+    clock_t wait_ticks = (clock_t)((double)ms * (double)CLOCKS_PER_SEC / 1000.0);
+
+    while ((clock() - start) < wait_ticks) {
+        /* busy wait */
     }
-    usleep(50000); // Pause between notes
 }
 
-int main() {
-    int fd = open("/dev/console", O_WRONLY);
-    
-    if (fd == -1) {
-        fd = open("/dev/tty", O_WRONLY);
-        if (fd == -1) {
-            fprintf(stderr, "Error: Cannot access console.\n");
-            fprintf(stderr, "Try running: sudo ./song\n");
-            return 1;
-        }
+/* Play one beat: either beep or rest for the given duration. */
+static void play_beat(Beat b)
+{
+    if (!b.is_rest) {
+        putchar('\a');      /* terminal bell */
+        fflush(stdout);
     }
-    
-    printf("🎵 Playing: Mary Had a Little Lamb\n");
-    
-    Note song[] = {
-        {E4, QUARTER}, {D4, QUARTER}, {C4, QUARTER}, {D4, QUARTER},
-        {E4, QUARTER}, {E4, QUARTER}, {E4, HALF},
-        {D4, QUARTER}, {D4, QUARTER}, {D4, HALF},
-        {E4, QUARTER}, {G4, QUARTER}, {G4, HALF},
-        {E4, QUARTER}, {D4, QUARTER}, {C4, QUARTER}, {D4, QUARTER},
-        {E4, QUARTER}, {E4, QUARTER}, {E4, QUARTER}, {E4, QUARTER},
-        {D4, QUARTER}, {D4, QUARTER}, {E4, QUARTER}, {D4, QUARTER},
-        {C4, WHOLE},
-        {0, 0}
+    sleep_ms(b.duration_ms);
+}
+
+int main(void)
+{
+    /* Twinkle Twinkle Little Star rhythm (no pitch, just timing).
+       Q = quarter note duration in milliseconds. */
+    const int Q = 300;
+
+    Beat song[] = {
+        /* C  C  G  G  A  A  G  - */
+        {0, Q}, {0, Q}, {0, Q}, {0, Q},
+        {0, Q}, {0, Q}, {0, 2*Q},
+
+        /* F  F  E  E  D  D  C  - */
+        {0, Q}, {0, Q}, {0, Q}, {0, Q},
+        {0, Q}, {0, Q}, {0, 2*Q},
+
+        /* G  G  F  F  E  E  D  - */
+        {0, Q}, {0, Q}, {0, Q}, {0, Q},
+        {0, Q}, {0, Q}, {0, 2*Q},
+
+        /* G  G  F  F  E  E  D  - */
+        {0, Q}, {0, Q}, {0, Q}, {0, Q},
+        {0, Q}, {0, Q}, {0, 2*Q},
+
+        /* C  C  G  G  A  A  G  - */
+        {0, Q}, {0, Q}, {0, Q}, {0, Q},
+        {0, Q}, {0, Q}, {0, 2*Q},
+
+        /* F  F  E  E  D  D  C  - */
+        {0, Q}, {0, Q}, {0, Q}, {0, Q},
+        {0, Q}, {0, Q}, {0, 2*Q},
     };
-    
-    for (int i = 0; song[i].freq != 0 || song[i].duration != 0; i++) {
-        play_note(fd, song[i].freq, song[i].duration);
+
+    int num_beats = (int)(sizeof(song) / sizeof(song[0]));
+    int i;
+
+    printf("Playing song (if your terminal bell is enabled)...\n");
+
+    for (i = 0; i < num_beats; ++i) {
+        play_beat(song[i]);
+        /* small gap between beats so they don't run together */
+        sleep_ms(40);
     }
-    
-    close(fd);
-    printf("✓ Done!\n");
+
+    printf("\nDone.\n");
     return 0;
 }
