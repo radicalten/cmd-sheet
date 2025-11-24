@@ -1,402 +1,423 @@
-/*
- * ASCII SUPER SPRINT / OFF ROAD RACER
- * Single file, no external dependencies (uses standard system headers).
- * Works on Windows (MinGW/MSVC) and Linux/macOS (GCC/Clang).
- *
- * CONTROLS:
- *   W / Up Arrow    : Accelerate
- *   A / Left Arrow  : Turn Left
- *   D / Right Arrow : Turn Right
- *   Q               : Quit
- */
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
+#include <unistd.h>
+#include <termios.h>
+#include <fcntl.h>
 
-/* --- PLATFORM SPECIFIC SETUP --- */
-#if defined(_WIN32) || defined(_WIN64)
-    #include <windows.h>
-    #include <conio.h>
-    #define PLATFORM_WINDOWS
-    
-    void setup_console() {
-        // Hide Cursor
-        HANDLE consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
-        CONSOLE_CURSOR_INFO info;
-        info.dwSize = 100;
-        info.bVisible = FALSE;
-        SetConsoleCursorInfo(consoleHandle, &info);
-    }
+#define TRACK_WIDTH 80
+#define TRACK_HEIGHT 30
+#define MAX_CARS 4
+#define TOTAL_LAPS 3
+#define PI 3.14159265359
 
-    void clear_screen_buffer() {
-        HANDLE consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
-        COORD cursorCoord = {0, 0};
-        SetConsoleCursorPosition(consoleHandle, cursorCoord);
-    }
+// Track elements
+#define TRACK_WALL '#'
+#define TRACK_ROAD ' '
+#define TRACK_FINISH '='
+#define TRACK_DIRT '.'
 
-    void sleep_ms(int ms) {
-        Sleep(ms);
-    }
-
-    int key_pressed() {
-        return _kbhit();
-    }
-
-    int get_key() {
-        return _getch();
-    }
-
-#else
-    #include <unistd.h>
-    #include <termios.h>
-    #include <sys/ioctl.h>
-    #include <sys/time.h>
-    #define PLATFORM_LINUX
-
-    void setup_console() {
-        // Hide cursor and clear screen
-        printf("\033[?25l"); 
-        printf("\033[2J");
-    }
-
-    // Non-blocking keyboard input setup for Linux
-    int key_pressed() {
-        struct timeval tv = { 0L, 0L };
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(0, &fds);
-        return select(1, &fds, NULL, NULL, &tv) > 0;
-    }
-
-    int get_key() {
-        int r;
-        unsigned char c;
-        if ((r = read(0, &c, sizeof(c))) < 0) return r;
-        return c;
-    }
-
-    void clear_screen_buffer() {
-        // Move cursor to top left
-        printf("\033[H"); 
-    }
-
-    void sleep_ms(int ms) {
-        usleep(ms * 1000);
-    }
-    
-    // Set terminal to raw mode to get input without Enter
-    struct termios orig_termios;
-    void reset_terminal_mode() {
-        tcsetattr(0, TCSANOW, &orig_termios);
-        printf("\033[?25h"); // Show cursor
-    }
-    
-    void set_conio_terminal_mode() {
-        struct termios new_termios;
-        tcgetattr(0, &orig_termios);
-        memcpy(&new_termios, &orig_termios, sizeof(new_termios));
-        atexit(reset_terminal_mode);
-        cfmakeraw(&new_termios);
-        tcsetattr(0, TCSANOW, &new_termios);
-    }
-#endif
-
-/* --- GAME CONSTANTS & MATH --- */
-#define PI 3.14159265
-#define WIDTH 60
-#define HEIGHT 30
-#define FPS 30
-
-// Physics Tuning
-#define ACCEL 0.05f
-#define MAX_SPEED 1.2f
-#define TURN_SPEED 0.15f
-#define FRICTION 0.96f
-#define WALL_BOUNCE -0.5f
-
+// Game structures
 typedef struct {
-    float x, y;
-    float vx, vy;
-    float angle; // Radians
-    int color;   // Not fully utilized in ASCII, but good for expansion
-    int laps;
-    int last_checkpoint;
+    double x, y;
+    double vx, vy;
+    double angle;
+    double speed;
+    int lap;
+    int checkpoint;
     char symbol;
+    int is_ai;
+    int finished;
+    int finish_position;
 } Car;
 
-// ASCII Track Layout (60x30)
-// # = Wall, . = Road, 1-4 = Checkpoints
-const char TRACK_DATA[HEIGHT][WIDTH+1] = {
-    "############################################################",
-    "#..........................................................#",
-    "#...####################################################...#",
-    "#...#1.................................................#...#",
-    "#...#..................................................#...#",
-    "#...#.......####################################.......#...#",
-    "#...#.......#..................................#.......#...#",
-    "#...#.......#..................................#.......#...#",
-    "#...#.......#.......####################.......#.......#...#",
-    "#...#.......#.......#..................#.......#.......#...#",
-    "#...#.......#.......#..................#.......#.......#...#",
-    "#...#.......#.......#...############...#.......#.......#...#",
-    "#...#.......#.......#...#..........#...#.......#.......#...#",
-    "#...#.......#.......#...#..........#...#.......#.......#...#",
-    "#2..#.......#.......#...#..........#...#.......#.......#..3#",
-    "#...#.......#.......#...#..........#...#.......#.......#...#",
-    "#...#.......#.......#...#..........#...#.......#.......#...#",
-    "#...#.......#.......#...#..........#...#.......#.......#...#",
-    "#...#.......#.......#...############...#.......#.......#...#",
-    "#...#.......#.......#..................#.......#.......#...#",
-    "#...#.......#.......#..................#.......#.......#...#",
-    "#...#.......#.......####################.......#.......#...#",
-    "#...#.......#..................................#.......#...#",
-    "#...#.......#..................................#.......#...#",
-    "#...#.......####################################.......#...#",
-    "#...#..................................................#...#",
-    "#...#.........................4........................#...#",
-    "#...####################################################...#",
-    "#.............................=............................#", // = is Start
-    "############################################################"
-};
+typedef struct {
+    int x, y;
+} Checkpoint;
 
-// AI Waypoints (simple x,y targets)
-float waypoints[][2] = {
-    {30, 28}, {55, 28}, {55, 14}, {55, 2}, {30, 2}, {4, 2}, {4, 14}, {4, 28}
-};
-int num_waypoints = 8;
+// Global variables
+char track[TRACK_HEIGHT][TRACK_WIDTH];
+Car cars[MAX_CARS];
+Checkpoint checkpoints[10];
+int num_checkpoints = 0;
+int game_over = 0;
+int next_finish_pos = 1;
 
-/* --- LOGIC --- */
+// Terminal handling
+struct termios orig_termios;
 
-// Get character based on angle for visual flair
-char get_car_char(float angle) {
-    // Normalize angle 0 to 2PI
-    while (angle < 0) angle += 2 * PI;
-    while (angle >= 2 * PI) angle -= 2 * PI;
-    
-    // 8 directions
-    int dir = (int)((angle + PI/8.0) / (PI/4.0)) % 8;
-    
-    char chars[] = {'>', 'v', 'v', '<', '<', '^', '^', '>'}; 
-    // Note: Diagonals in ASCII are tricky, sticking to simplified set for clarity
-    // Or detailed: > \ v / < \ ^ /
-    char detailed[] = {'>', '\\', 'v', '/', '<', '\\', '^', '/'};
-    return detailed[dir];
+void reset_terminal() {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 }
 
-void update_physics(Car *c, int input_up, int input_left, int input_right) {
-    // Steering
-    if (input_left) c->angle -= TURN_SPEED;
-    if (input_right) c->angle += TURN_SPEED;
+void setup_terminal() {
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    atexit(reset_terminal);
+    
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
 
-    // Acceleration (Vector math)
-    if (input_up) {
-        c->vx += cos(c->angle) * ACCEL;
-        c->vy += sin(c->angle) * ACCEL;
+void clear_screen() {
+    printf("\033[2J\033[H");
+}
+
+void hide_cursor() {
+    printf("\033[?25l");
+}
+
+void show_cursor() {
+    printf("\033[?25h");
+}
+
+// Initialize the track
+void init_track() {
+    // Fill with road
+    for (int y = 0; y < TRACK_HEIGHT; y++) {
+        for (int x = 0; x < TRACK_WIDTH; x++) {
+            track[y][x] = TRACK_ROAD;
+        }
     }
-
-    // Friction (Drifting feel)
-    c->vx *= FRICTION;
-    c->vy *= FRICTION;
-
-    // Cap Speed
-    float speed = sqrt(c->vx*c->vx + c->vy*c->vy);
-    if (speed > MAX_SPEED) {
-        c->vx = (c->vx / speed) * MAX_SPEED;
-        c->vy = (c->vy / speed) * MAX_SPEED;
+    
+    // Outer walls
+    for (int x = 0; x < TRACK_WIDTH; x++) {
+        track[0][x] = TRACK_WALL;
+        track[TRACK_HEIGHT-1][x] = TRACK_WALL;
     }
+    for (int y = 0; y < TRACK_HEIGHT; y++) {
+        track[y][0] = TRACK_WALL;
+        track[y][TRACK_WIDTH-1] = TRACK_WALL;
+    }
+    
+    // Inner obstacle (creates oval track)
+    for (int y = 8; y < TRACK_HEIGHT - 8; y++) {
+        for (int x = 25; x < TRACK_WIDTH - 25; x++) {
+            track[y][x] = TRACK_WALL;
+        }
+    }
+    
+    // Add some dirt patches for challenge
+    for (int i = 0; i < 30; i++) {
+        int x = 10 + rand() % (TRACK_WIDTH - 20);
+        int y = 5 + rand() % (TRACK_HEIGHT - 10);
+        if (track[y][x] == TRACK_ROAD) {
+            track[y][x] = TRACK_DIRT;
+        }
+    }
+    
+    // Finish line
+    for (int x = 2; x < 10; x++) {
+        track[TRACK_HEIGHT/2][x] = TRACK_FINISH;
+    }
+    
+    // Setup checkpoints for lap counting
+    num_checkpoints = 4;
+    checkpoints[0].x = 5; checkpoints[0].y = TRACK_HEIGHT/2;  // Start
+    checkpoints[1].x = 40; checkpoints[1].y = 5;               // Top
+    checkpoints[2].x = 75; checkpoints[2].y = TRACK_HEIGHT/2;  // Right
+    checkpoints[3].x = 40; checkpoints[3].y = TRACK_HEIGHT-5;  // Bottom
+}
 
-    // Predict next position
-    float next_x = c->x + c->vx;
-    float next_y = c->y + c->vy;
+// Initialize cars
+void init_cars() {
+    int start_positions[MAX_CARS][2] = {
+        {8, TRACK_HEIGHT/2 - 1},
+        {8, TRACK_HEIGHT/2},
+        {8, TRACK_HEIGHT/2 + 1},
+        {7, TRACK_HEIGHT/2}
+    };
+    
+    char symbols[MAX_CARS] = {'P', '1', '2', '3'};
+    
+    for (int i = 0; i < MAX_CARS; i++) {
+        cars[i].x = start_positions[i][0];
+        cars[i].y = start_positions[i][1];
+        cars[i].vx = 0;
+        cars[i].vy = 0;
+        cars[i].angle = 0;
+        cars[i].speed = 0;
+        cars[i].lap = 0;
+        cars[i].checkpoint = 0;
+        cars[i].symbol = symbols[i];
+        cars[i].is_ai = (i != 0);
+        cars[i].finished = 0;
+        cars[i].finish_position = 0;
+    }
+}
 
-    // Collision Detection (Grid based)
-    int grid_x = (int)next_x;
-    int grid_y = (int)next_y;
+// Check if position is valid (not a wall)
+int is_valid_position(double x, double y) {
+    int ix = (int)(x + 0.5);
+    int iy = (int)(y + 0.5);
+    
+    if (ix < 0 || ix >= TRACK_WIDTH || iy < 0 || iy >= TRACK_HEIGHT) {
+        return 0;
+    }
+    
+    return track[iy][ix] != TRACK_WALL;
+}
 
-    if (grid_x >= 0 && grid_x < WIDTH && grid_y >= 0 && grid_y < HEIGHT) {
-        if (TRACK_DATA[grid_y][grid_x] == '#') {
-            // Bounce!
-            c->vx *= WALL_BOUNCE;
-            c->vy *= WALL_BOUNCE;
-            // Push out slightly to prevent getting stuck
-            c->x += c->vx;
-            c->y += c->vy;
-        } else {
-            // Move
-            c->x = next_x;
-            c->y = next_y;
+// Get friction based on terrain
+double get_friction(double x, double y) {
+    int ix = (int)(x + 0.5);
+    int iy = (int)(y + 0.5);
+    
+    if (ix < 0 || ix >= TRACK_WIDTH || iy < 0 || iy >= TRACK_HEIGHT) {
+        return 0.95;
+    }
+    
+    if (track[iy][ix] == TRACK_DIRT) {
+        return 0.85; // More friction on dirt
+    }
+    
+    return 0.95; // Normal road friction
+}
+
+// Update checkpoint progress
+void update_checkpoint(Car *car) {
+    if (car->finished) return;
+    
+    int next_checkpoint = (car->checkpoint + 1) % num_checkpoints;
+    double dx = car->x - checkpoints[next_checkpoint].x;
+    double dy = car->y - checkpoints[next_checkpoint].y;
+    double dist = sqrt(dx*dx + dy*dy);
+    
+    if (dist < 5.0) {
+        car->checkpoint = next_checkpoint;
+        
+        // Crossed finish line
+        if (next_checkpoint == 0 && car->lap > 0) {
+            car->lap++;
+            if (car->lap > TOTAL_LAPS) {
+                car->finished = 1;
+                car->finish_position = next_finish_pos++;
+            }
+        } else if (next_checkpoint == 0) {
+            car->lap = 1;
         }
     }
 }
 
-void check_laps(Car *c) {
-    int gx = (int)c->x;
-    int gy = (int)c->y;
-    char tile = TRACK_DATA[gy][gx];
+// Simple AI logic
+void update_ai(Car *car) {
+    if (car->finished) {
+        car->speed *= 0.9;
+        return;
+    }
+    
+    int target_cp = (car->checkpoint + 1) % num_checkpoints;
+    double target_x = checkpoints[target_cp].x;
+    double target_y = checkpoints[target_cp].y;
+    
+    double dx = target_x - car->x;
+    double dy = target_y - car->y;
+    double target_angle = atan2(dy, dx);
+    
+    // Adjust angle towards target
+    double angle_diff = target_angle - car->angle;
+    while (angle_diff > PI) angle_diff -= 2*PI;
+    while (angle_diff < -PI) angle_diff += 2*PI;
+    
+    if (angle_diff > 0.1) {
+        car->angle += 0.08;
+    } else if (angle_diff < -0.1) {
+        car->angle -= 0.08;
+    }
+    
+    // AI acceleration
+    double target_speed = 1.5 + (rand() % 100) / 200.0;
+    if (car->speed < target_speed) {
+        car->speed += 0.15;
+    }
+    if (car->speed > target_speed) {
+        car->speed -= 0.05;
+    }
+}
 
-    // Simple checkpoint system
-    if (tile >= '1' && tile <= '4') {
-        int cp = tile - '0';
-        if (cp == c->last_checkpoint + 1) {
-            c->last_checkpoint = cp;
+// Update car physics
+void update_car(Car *car, int accel, int turn_left, int turn_right, int brake) {
+    if (car->is_ai) {
+        update_ai(car);
+    } else {
+        // Player controls
+        if (turn_left) car->angle -= 0.12;
+        if (turn_right) car->angle += 0.12;
+        
+        if (accel) {
+            car->speed += 0.2;
+            if (car->speed > 2.5) car->speed = 2.5;
+        }
+        
+        if (brake) {
+            car->speed -= 0.3;
+            if (car->speed < 0) car->speed = 0;
         }
     }
     
-    // Start line logic (simplified for ASCII)
-    // In track data, '=' is the start line area roughly at (30, 28)
-    if (tile == '=' && c->last_checkpoint == 4) {
-        c->laps++;
-        c->last_checkpoint = 0;
-    }
-}
-
-void update_ai(Car *ai, Car *player) {
-    // Find target waypoint
-    float tx = waypoints[ai->last_checkpoint % num_waypoints][0];
-    float ty = waypoints[ai->last_checkpoint % num_waypoints][1];
-
-    // Distance to target
-    float dx = tx - ai->x;
-    float dy = ty - ai->y;
-    float dist = sqrt(dx*dx + dy*dy);
-
-    // If close, target next
-    if (dist < 4.0f) {
-        ai->last_checkpoint++;
-    }
-
-    // Desired angle
-    float target_angle = atan2(dy, dx);
+    // Apply friction
+    double friction = get_friction(car->x, car->y);
+    car->speed *= friction;
     
-    // Basic steering logic to face target
-    float diff = target_angle - ai->angle;
-    while (diff <= -PI) diff += 2*PI;
-    while (diff > PI) diff -= 2*PI;
-
-    int left = 0, right = 0, up = 1; // Always gas
-    if (diff > 0.1) right = 1;
-    if (diff < -0.1) left = 1;
-
-    // AI slows down if turning hard
-    if (fabs(diff) > 1.0) up = 0; 
-
-    update_physics(ai, up, left, right);
+    // Calculate velocity from angle and speed
+    car->vx = cos(car->angle) * car->speed;
+    car->vy = sin(car->angle) * car->speed;
+    
+    // Try to move
+    double new_x = car->x + car->vx;
+    double new_y = car->y + car->vy;
+    
+    // Collision detection
+    if (is_valid_position(new_x, new_y)) {
+        car->x = new_x;
+        car->y = new_y;
+    } else {
+        // Hit wall - bounce back and lose speed
+        car->speed *= 0.3;
+        car->vx *= -0.5;
+        car->vy *= -0.5;
+    }
+    
+    // Keep in bounds
+    if (car->x < 1) car->x = 1;
+    if (car->x >= TRACK_WIDTH-1) car->x = TRACK_WIDTH-2;
+    if (car->y < 1) car->y = 1;
+    if (car->y >= TRACK_HEIGHT-1) car->y = TRACK_HEIGHT-2;
+    
+    update_checkpoint(car);
 }
 
-/* --- MAIN --- */
+// Render the game
+void render() {
+    char display[TRACK_HEIGHT][TRACK_WIDTH];
+    
+    // Copy track to display
+    memcpy(display, track, sizeof(track));
+    
+    // Draw cars
+    for (int i = 0; i < MAX_CARS; i++) {
+        int x = (int)(cars[i].x + 0.5);
+        int y = (int)(cars[i].y + 0.5);
+        if (x >= 0 && x < TRACK_WIDTH && y >= 0 && y < TRACK_HEIGHT) {
+            display[y][x] = cars[i].symbol;
+        }
+    }
+    
+    // Print display
+    clear_screen();
+    for (int y = 0; y < TRACK_HEIGHT; y++) {
+        for (int x = 0; x < TRACK_WIDTH; x++) {
+            putchar(display[y][x]);
+        }
+        putchar('\n');
+    }
+    
+    // Print status
+    printf("\n");
+    printf("Player (P) - Lap: %d/%d | Speed: %.1f | ", 
+           cars[0].lap, TOTAL_LAPS, cars[0].speed);
+    
+    if (cars[0].finished) {
+        printf("FINISHED #%d!", cars[0].finish_position);
+    }
+    
+    printf("\nControls: W=Accelerate, A/D=Turn, S=Brake, Q=Quit\n");
+    
+    // Show positions
+    printf("\nPositions: ");
+    for (int pos = 1; pos <= next_finish_pos - 1; pos++) {
+        for (int i = 0; i < MAX_CARS; i++) {
+            if (cars[i].finish_position == pos) {
+                printf("#%d:%c ", pos, cars[i].symbol);
+            }
+        }
+    }
+    
+    fflush(stdout);
+}
 
+// Main game loop
 int main() {
-    #ifdef PLATFORM_LINUX
-    set_conio_terminal_mode();
-    #endif
-    setup_console();
-
-    Car player = {30.0f, 28.0f, 0, 0, 0, 1, 0, 0, 'P'}; // Angle 0 = Right
-    Car cpu    = {28.0f, 28.0f, 0, 0, 0, 2, 0, 0, 'C'};
-
-    // Screen Buffer
-    char buffer[HEIGHT * (WIDTH + 1) + 1]; 
-
-    int running = 1;
+    srand(time(NULL));
     
-    while (running) {
-        // 1. Input
-        int up=0, left=0, right=0;
-        
-        if (key_pressed()) {
-            int k = get_key();
-            #ifdef PLATFORM_WINDOWS
-            // Windows arrow keys return 224 then code
-            if (k == 224) { 
-                k = get_key();
-                if (k == 72) up = 1;    // Up
-                if (k == 75) left = 1;  // Left
-                if (k == 77) right = 1; // Right
-            }
-            #else
-            // Linux/ANSI escape codes (simplified)
-            if (k == 27 && key_pressed()) {
-                 get_key(); // skip [
-                 int arrow = get_key();
-                 if (arrow == 'A') up = 1;
-                 if (arrow == 'D') left = 1;
-                 if (arrow == 'C') right = 1;
-            }
-            #endif
-            
-            // WASD support
-            if (k == 'w' || k == 'W') up = 1;
-            if (k == 'a' || k == 'A') left = 1;
-            if (k == 'd' || k == 'D') right = 1;
-            if (k == 'q' || k == 'Q') running = 0;
-        }
-
-        // 2. Update
-        update_physics(&player, up, left, right);
-        check_laps(&player);
-
-        // AI runs automatically
-        update_ai(&cpu, &player); // CPU just chases waypoints, doesn't react to player
-
-        // 3. Render
-        clear_screen_buffer();
-        
-        // Fill buffer with track
-        int b_idx = 0;
-        for (int y = 0; y < HEIGHT; y++) {
-            for (int x = 0; x < WIDTH; x++) {
-                buffer[b_idx++] = TRACK_DATA[y][x];
-            }
-            buffer[b_idx++] = '\n';
-        }
-        buffer[b_idx] = '\0';
-
-        // Draw Cars into buffer
-        auto draw_car = [&](Car *c, char symbol) {
-            int cx = (int)c->x;
-            int cy = (int)c->y;
-            if (cx >= 0 && cx < WIDTH && cy >= 0 && cy < HEIGHT) {
-                // Calculate index in buffer: y * (WIDTH + newline) + x
-                int idx = cy * (WIDTH + 1) + cx;
-                buffer[idx] = get_car_char(c->angle);
-                // If you want a specific letter instead of arrow:
-                // buffer[idx] = symbol; 
-            }
-        };
-
-        // Since we are in C, we can't use lambdas easily without C++, 
-        // so we just inline the logic or use helper function logic here.
-        // Player
-        int px = (int)player.x;
-        int py = (int)player.y;
-        if (px >=0 && px < WIDTH && py >= 0 && py < HEIGHT) {
-            buffer[py * (WIDTH + 1) + px] = get_car_char(player.angle);
-        }
-        // CPU
-        int cx = (int)cpu.x;
-        int cy = (int)cpu.y;
-        if (cx >=0 && cx < WIDTH && cy >= 0 && cy < HEIGHT) {
-             // Make CPU look different or same
-             // If overlap, player draws on top
-             if (cx != px || cy != py)
-                buffer[cy * (WIDTH + 1) + cx] = 'C';
-        }
-
-        // Print Frame
-        printf("%s", buffer);
-        
-        // HUD
-        printf("PLAYER LAPS: %d  |  CPU LAPS: %d  |  Q to Quit\n", player.laps, cpu.laps/8); // CPU laps logic hacky due to waypoint index usage
-
-        // 4. Framerate cap
-        sleep_ms(1000 / FPS);
+    setup_terminal();
+    hide_cursor();
+    clear_screen();
+    
+    init_track();
+    init_cars();
+    
+    printf("TOP-DOWN RACING!\n");
+    printf("Race %d laps around the track!\n", TOTAL_LAPS);
+    printf("Press any key to start...\n");
+    
+    // Wait for keypress
+    while (getchar() == EOF) {
+        usleep(10000);
     }
-
-    #ifdef PLATFORM_LINUX
-    printf("\033[?25h"); // Restore cursor
-    #endif
+    
+    int accel = 0, turn_left = 0, turn_right = 0, brake = 0;
+    
+    while (!game_over) {
+        // Input handling
+        char c;
+        accel = turn_left = turn_right = brake = 0;
+        
+        while (read(STDIN_FILENO, &c, 1) == 1) {
+            if (c == 'q' || c == 'Q') game_over = 1;
+            if (c == 'w' || c == 'W') accel = 1;
+            if (c == 's' || c == 'S') brake = 1;
+            if (c == 'a' || c == 'A') turn_left = 1;
+            if (c == 'd' || c == 'D') turn_right = 1;
+        }
+        
+        // Update all cars
+        for (int i = 0; i < MAX_CARS; i++) {
+            if (i == 0) {
+                update_car(&cars[i], accel, turn_left, turn_right, brake);
+            } else {
+                update_car(&cars[i], 0, 0, 0, 0);
+            }
+        }
+        
+        // Check if all cars finished
+        int all_finished = 1;
+        for (int i = 0; i < MAX_CARS; i++) {
+            if (!cars[i].finished) {
+                all_finished = 0;
+                break;
+            }
+        }
+        if (all_finished) game_over = 1;
+        
+        // Render
+        render();
+        
+        // Frame delay (~30 FPS)
+        usleep(33000);
+    }
+    
+    clear_screen();
+    show_cursor();
+    
+    printf("\n=== RACE COMPLETE ===\n\n");
+    printf("Final Results:\n");
+    for (int pos = 1; pos < next_finish_pos; pos++) {
+        for (int i = 0; i < MAX_CARS; i++) {
+            if (cars[i].finish_position == pos) {
+                printf("  #%d: %c %s\n", pos, cars[i].symbol, 
+                       i == 0 ? "(You)" : "(CPU)");
+            }
+        }
+    }
+    printf("\nThanks for playing!\n");
+    
     return 0;
 }
