@@ -1,400 +1,589 @@
+/*
+ * Single-file top-down ASCII racing game.
+ *
+ * Platform: Unix-like terminal (Linux/macOS), ANSI escape capable.
+ * Build: gcc -O2 -Wall -std=c99 -o ascii_racer ascii_racer.c
+ *
+ * Controls:
+ *   W/A/S/D : move up/left/down/right
+ *   Q       : quit
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <ctype.h>
 #include <string.h>
-#include <math.h>
-#include <time.h>
 
-#ifdef _WIN32
-    #include <conio.h>
-    #include <windows.h>
-#else
-    #include <unistd.h>
-    #include <termios.h>
-    #include <fcntl.h>
-#endif
+/* --------- Configurable constants --------- */
 
-// Constants
-#define WIDTH 80
-#define HEIGHT 35
-#define MAX_ENEMIES 3
+#define MAP_W 40
+#define MAP_H 17
+
+#define HUD_ROWS 4          /* rows reserved for HUD at top */
+#define MAX_PATH_LEN 512
+#define MAX_ENEMIES 2
+#define TARGET_FPS 25
 #define LAPS_TO_WIN 3
-#define PI 3.14159265359
 
-// Track parameters
-#define TRACK_CENTER_X 40
-#define TRACK_CENTER_Y 17
-#define TRACK_RADIUS_X 30
-#define TRACK_RADIUS_Y 12
-#define TRACK_WIDTH 6
-
-// Colors (ANSI escape codes)
-#define COLOR_RESET "\033[0m"
-#define COLOR_RED "\033[31m"
-#define COLOR_GREEN "\033[32m"
-#define COLOR_YELLOW "\033[33m"
-#define COLOR_BLUE "\033[34m"
-#define COLOR_MAGENTA "\033[35m"
-#define COLOR_CYAN "\033[36m"
-#define COLOR_WHITE "\033[37m"
-#define COLOR_BG_GREEN "\033[42m"
-#define COLOR_BG_GRAY "\033[100m"
+/* --------- Basic types --------- */
 
 typedef struct {
-    double x, y;
-    double angle;
-    double speed;
-    int lap;
-    int checkpoint;
-    char *color;
-} Car;
+    int x, y;
+} Point;
 
-char screen[HEIGHT][WIDTH];
-Car player;
-Car enemies[MAX_ENEMIES];
-time_t start_time;
-int game_over = 0;
-int player_won = 0;
+typedef struct {
+    int x, y;
+    int laps;
+    int passed_checkpoint;
+    int on_start;
+    int finished;
+    double finish_time;
+} Player;
 
-// Platform-specific functions
-#ifdef _WIN32
-void setup_terminal() {
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD dwMode = 0;
-    GetConsoleMode(hOut, &dwMode);
-    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    SetConsoleMode(hOut, dwMode);
+typedef struct {
+    int path_index;
+    int laps;
+    int started;
+    int finished;
+    double finish_time;
+    Point pos;
+    int move_delay;   /* frames between moves */
+    int move_counter;
+    char symbol;
+} EnemyCar;
+
+/* --------- Globals for track and timing --------- */
+
+static char base_map[MAP_H][MAP_W]; /* without dynamic entities */
+static Point path[MAX_PATH_LEN];
+static int path_len = 0;
+
+static int start_x = 0, start_y = 0;
+static int checkpoint_x = 0, checkpoint_y = 0;
+
+/* Terminal state */
+static struct termios orig_termios;
+static int raw_mode_enabled = 0;
+
+/* --------- Time helpers --------- */
+
+static double get_time_sec(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
-int kbhit() {
-    return _kbhit();
+static void format_time(double seconds, char *buf, size_t sz) {
+    if (seconds < 0) seconds = 0;
+    int minutes = (int)(seconds / 60.0);
+    double rem = seconds - minutes * 60.0;
+    int secs = (int)rem;
+    int centi = (int)((rem - secs) * 100.0 + 0.5);
+    snprintf(buf, sz, "%02d:%02d.%02d", minutes, secs, centi);
 }
 
-char get_key() {
-    return _getch();
-}
+/* --------- Terminal raw mode / input --------- */
 
-void sleep_ms(int ms) {
-    Sleep(ms);
-}
-#else
-void setup_terminal() {
-    struct termios t;
-    tcgetattr(STDIN_FILENO, &t);
-    t.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &t);
-}
-
-int kbhit() {
-    struct termios oldt, newt;
-    int ch;
-    int oldf;
-    
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
-    
-    ch = getchar();
-    
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    fcntl(STDIN_FILENO, F_SETFL, oldf);
-    
-    if(ch != EOF) {
-        ungetc(ch, stdin);
-        return 1;
+static void disable_raw_mode(void) {
+    if (raw_mode_enabled) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        raw_mode_enabled = 0;
     }
-    
-    return 0;
 }
 
-char get_key() {
-    return getchar();
+static void enable_raw_mode(void) {
+    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) {
+        perror("tcgetattr");
+        exit(1);
+    }
+
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON); /* no echo, no canonical mode */
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
+        perror("tcsetattr");
+        exit(1);
+    }
+    raw_mode_enabled = 1;
 }
 
-void sleep_ms(int ms) {
-    usleep(ms * 1000);
-}
-#endif
+static int kbhit(void) {
+    struct timeval tv;
+    fd_set fds;
 
-void clear_screen() {
-    printf("\033[2J\033[H");
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+
+    int r = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+    if (r < 0) return 0;
+    return FD_ISSET(STDIN_FILENO, &fds);
 }
 
-void init_screen() {
-    for(int y = 0; y < HEIGHT; y++) {
-        for(int x = 0; x < WIDTH; x++) {
-            screen[y][x] = ' ';
+/* Returns -1 if no key, otherwise unsigned char in 0..255 */
+static int read_key(void) {
+    if (!kbhit()) return -1;
+    unsigned char ch;
+    ssize_t n = read(STDIN_FILENO, &ch, 1);
+    if (n <= 0) return -1;
+    return (int)ch;
+}
+
+/* --------- Track generation --------- */
+
+static void generate_track(void) {
+    int x, y;
+
+    /* Fill with spaces */
+    for (y = 0; y < MAP_H; y++) {
+        for (x = 0; x < MAP_W; x++) {
+            base_map[y][x] = ' ';
         }
     }
-}
 
-int is_on_track(double x, double y) {
-    double dx = (x - TRACK_CENTER_X) / TRACK_RADIUS_X;
-    double dy = (y - TRACK_CENTER_Y) / TRACK_RADIUS_Y;
-    double dist = sqrt(dx * dx + dy * dy);
-    
-    double inner = 1.0 - (TRACK_WIDTH / 2.0) / TRACK_RADIUS_Y;
-    double outer = 1.0 + (TRACK_WIDTH / 2.0) / TRACK_RADIUS_Y;
-    
-    return dist >= inner && dist <= outer;
-}
+    /* Outer border walls */
+    for (x = 0; x < MAP_W; x++) {
+        base_map[0][x] = '#';
+        base_map[MAP_H - 1][x] = '#';
+    }
+    for (y = 0; y < MAP_H; y++) {
+        base_map[y][0] = '#';
+        base_map[y][MAP_W - 1] = '#';
+    }
 
-void init_car(Car *car, double angle_offset, char *color, int is_player) {
-    car->angle = angle_offset;
-    car->x = TRACK_CENTER_X + cos(car->angle) * TRACK_RADIUS_X;
-    car->y = TRACK_CENTER_Y + sin(car->angle) * TRACK_RADIUS_Y;
-    car->speed = 0;
-    car->lap = 0;
-    car->checkpoint = 0;
-    car->color = color;
-}
+    /* Inner border walls (one cell inside outer) */
+    for (x = 1; x < MAP_W - 1; x++) {
+        base_map[1][x] = '#';
+        base_map[MAP_H - 2][x] = '#';
+    }
+    for (y = 1; y < MAP_H - 1; y++) {
+        base_map[y][1] = '#';
+        base_map[y][MAP_W - 2] = '#';
+    }
 
-void draw_track() {
-    // Draw track
-    for(int y = 0; y < HEIGHT; y++) {
-        for(int x = 0; x < WIDTH; x++) {
-            if(is_on_track(x, y)) {
-                screen[y][x] = '.';
-            } else {
-                screen[y][x] = '#';
-            }
+    /* Interior filled with walls to keep a single ring track */
+    int left = 2, right = MAP_W - 3;
+    int top = 2, bottom = MAP_H - 3;
+
+    for (y = top + 1; y < bottom; y++) {
+        for (x = left + 1; x < right; x++) {
+            base_map[y][x] = '#';
         }
     }
-    
-    // Draw finish line
-    for(int i = -2; i <= 2; i++) {
-        int x = TRACK_CENTER_X + TRACK_RADIUS_X;
-        int y = TRACK_CENTER_Y + i;
-        if(y >= 0 && y < HEIGHT && x >= 0 && x < WIDTH) {
-            screen[y][x] = '|';
+
+    /* Build the rectangular ring path at offset 2 */
+    path_len = 0;
+
+    /* Top side: left -> right */
+    for (x = left; x <= right; x++) {
+        base_map[top][x] = '.';
+        if (path_len < MAX_PATH_LEN) {
+            path[path_len].x = x;
+            path[path_len].y = top;
+            path_len++;
         }
     }
+
+    /* Right side: top+1 -> bottom */
+    for (y = top + 1; y <= bottom; y++) {
+        base_map[y][right] = '.';
+        if (path_len < MAX_PATH_LEN) {
+            path[path_len].x = right;
+            path[path_len].y = y;
+            path_len++;
+        }
+    }
+
+    /* Bottom side: right-1 -> left */
+    for (x = right - 1; x >= left; x--) {
+        base_map[bottom][x] = '.';
+        if (path_len < MAX_PATH_LEN) {
+            path[path_len].x = x;
+            path[path_len].y = bottom;
+            path_len++;
+        }
+    }
+
+    /* Left side: bottom-1 -> top+1 */
+    for (y = bottom - 1; y > top; y--) {
+        base_map[y][left] = '.';
+        if (path_len < MAX_PATH_LEN) {
+            path[path_len].x = left;
+            path[path_len].y = y;
+            path_len++;
+        }
+    }
+
+    if (path_len <= 0) {
+        fprintf(stderr, "Path generation failed.\n");
+        exit(1);
+    }
+
+    /* Define start line at first path cell, checkpoint roughly opposite */
+    int start_index = 0;
+    int checkpoint_index = path_len / 2;
+
+    start_x = path[start_index].x;
+    start_y = path[start_index].y;
+    checkpoint_x = path[checkpoint_index].x;
+    checkpoint_y = path[checkpoint_index].y;
+
+    base_map[start_y][start_x] = 'S';
+    base_map[checkpoint_y][checkpoint_x] = 'C';
 }
 
-void update_checkpoint(Car *car) {
-    double angle = atan2(car->y - TRACK_CENTER_Y, car->x - TRACK_CENTER_X);
-    if(angle < 0) angle += 2 * PI;
-    
-    int new_checkpoint = (int)(angle / (PI / 2));
-    
-    if(new_checkpoint != car->checkpoint) {
-        if((car->checkpoint == 3 && new_checkpoint == 0)) {
-            car->lap++;
-        }
-        car->checkpoint = new_checkpoint;
-    }
-}
+/* --------- Drawing --------- */
 
-void update_car(Car *car, int is_player) {
-    if(!is_player) {
-        // Simple AI: follow the track
-        double target_angle = atan2(car->y - TRACK_CENTER_Y, car->x - TRACK_CENTER_X);
-        target_angle += 0.15;
-        
-        double target_x = TRACK_CENTER_X + cos(target_angle) * TRACK_RADIUS_X;
-        double target_y = TRACK_CENTER_Y + sin(target_angle) * TRACK_RADIUS_Y;
-        
-        double dx = target_x - car->x;
-        double dy = target_y - car->y;
-        double dist = sqrt(dx * dx + dy * dy);
-        
-        if(dist > 0.1) {
-            car->angle = atan2(dy, dx);
-            car->speed = 0.8;
-        }
-    }
-    
-    // Update position
-    double new_x = car->x + cos(car->angle) * car->speed;
-    double new_y = car->y + sin(car->angle) * car->speed;
-    
-    // Check if new position is on track
-    if(is_on_track(new_x, new_y)) {
-        car->x = new_x;
-        car->y = new_y;
-    } else {
-        car->speed *= 0.5; // Slow down when hitting walls
-    }
-    
-    // Apply friction
-    car->speed *= 0.95;
-    
-    update_checkpoint(car);
-    
-    // Check for win/lose
-    if(car->lap >= LAPS_TO_WIN) {
-        game_over = 1;
-        if(is_player) {
-            player_won = 1;
-        }
-    }
-}
+static void draw_game(const Player *player,
+                      const EnemyCar enemies[],
+                      int num_enemies,
+                      double elapsed) {
+    int x, y, i;
+    char buf[64];
 
-void draw_car(Car *car) {
-    int x = (int)(car->x + 0.5);
-    int y = (int)(car->y + 0.5);
-    
-    if(x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
-        screen[y][x] = 'O';
-    }
-}
+    /* Move cursor to home (do not clear whole screen every frame) */
+    printf("\033[H");
 
-void render() {
-    clear_screen();
-    
-    // Print screen buffer with colors
-    for(int y = 0; y < HEIGHT; y++) {
-        for(int x = 0; x < WIDTH; x++) {
-            char c = screen[y][x];
-            
-            // Check if any car is at this position
-            int is_player_pos = ((int)(player.x + 0.5) == x && (int)(player.y + 0.5) == y);
-            int enemy_idx = -1;
-            
-            for(int i = 0; i < MAX_ENEMIES; i++) {
-                if((int)(enemies[i].x + 0.5) == x && (int)(enemies[i].y + 0.5) == y) {
-                    enemy_idx = i;
-                    break;
-                }
-            }
-            
-            if(is_player_pos) {
-                printf("%sO%s", COLOR_GREEN, COLOR_RESET);
-            } else if(enemy_idx >= 0) {
-                printf("%sO%s", enemies[enemy_idx].color, COLOR_RESET);
-            } else if(c == '#') {
-                printf("%s#%s", COLOR_YELLOW, COLOR_RESET);
-            } else if(c == '.') {
-                printf("%s.%s", COLOR_WHITE, COLOR_RESET);
-            } else if(c == '|') {
-                printf("%s|%s", COLOR_CYAN, COLOR_RESET);
-            } else {
-                printf("%c", c);
-            }
-        }
-        printf("\n");
-    }
-    
-    // Print UI
-    time_t elapsed = time(NULL) - start_time;
-    printf("\n%s[PLAYER]%s Lap: %d/%d | Speed: %.1f | ", 
-           COLOR_GREEN, COLOR_RESET, player.lap, LAPS_TO_WIN, player.speed);
-    printf("Time: %ld:%02ld\n", elapsed / 60, elapsed % 60);
-    
-    for(int i = 0; i < MAX_ENEMIES; i++) {
-        printf("%s[CPU %d]%s Lap: %d/%d | ", 
-               enemies[i].color, i+1, COLOR_RESET, enemies[i].lap, LAPS_TO_WIN);
+    /* HUD */
+    printf("ASCII TOP-DOWN RACER\n");
+
+    format_time(elapsed, buf, sizeof(buf));
+    printf("Time: %s   Lap: %d/%d\n",
+           buf, player->laps, LAPS_TO_WIN);
+
+    printf("Enemies: ");
+    for (i = 0; i < num_enemies; i++) {
+        printf("%c:%d/%d ", enemies[i].symbol,
+               enemies[i].laps, LAPS_TO_WIN);
     }
     printf("\n");
-    printf("\nControls: W=Accelerate S=Brake A=Left D=Right Q=Quit\n");
-}
 
-void show_victory_screen() {
-    clear_screen();
-    time_t elapsed = time(NULL) - start_time;
-    
-    printf("\n\n\n");
-    if(player_won) {
-        printf("        %s╔═══════════════════════════════╗%s\n", COLOR_GREEN, COLOR_RESET);
-        printf("        %s║                               ║%s\n", COLOR_GREEN, COLOR_RESET);
-        printf("        %s║      🏆  VICTORY!  🏆        ║%s\n", COLOR_GREEN, COLOR_RESET);
-        printf("        %s║                               ║%s\n", COLOR_GREEN, COLOR_RESET);
-        printf("        %s║   You won the race!          ║%s\n", COLOR_GREEN, COLOR_RESET);
-        printf("        %s║                               ║%s\n", COLOR_GREEN, COLOR_RESET);
-        printf("        %s║   Time: %ld:%02ld                 ║%s\n", 
-               COLOR_GREEN, elapsed / 60, elapsed % 60, COLOR_RESET);
-        printf("        %s║                               ║%s\n", COLOR_GREEN, COLOR_RESET);
-        printf("        %s╚═══════════════════════════════╝%s\n", COLOR_GREEN, COLOR_RESET);
-    } else {
-        printf("        %s╔═══════════════════════════════╗%s\n", COLOR_RED, COLOR_RESET);
-        printf("        %s║                               ║%s\n", COLOR_RED, COLOR_RESET);
-        printf("        %s║         GAME OVER             ║%s\n", COLOR_RED, COLOR_RESET);
-        printf("        %s║                               ║%s\n", COLOR_RED, COLOR_RESET);
-        printf("        %s║   An opponent won the race!   ║%s\n", COLOR_RED, COLOR_RESET);
-        printf("        %s║                               ║%s\n", COLOR_RED, COLOR_RESET);
-        printf("        %s║   Better luck next time!      ║%s\n", COLOR_RED, COLOR_RESET);
-        printf("        %s║                               ║%s\n", COLOR_RED, COLOR_RESET);
-        printf("        %s╚═══════════════════════════════╝%s\n", COLOR_RED, COLOR_RESET);
+    printf("Controls: W/A/S/D to move, Q to quit\n");
+
+    /* Build display buffer from base map and overlay entities */
+    char disp[MAP_H][MAP_W];
+    for (y = 0; y < MAP_H; y++) {
+        for (x = 0; x < MAP_W; x++) {
+            disp[y][x] = base_map[y][x];
+        }
     }
-    printf("\n\n");
-}
 
-int main() {
-    setup_terminal();
-    srand(time(NULL));
-    
-    // Initialize game
-    init_car(&player, 0, COLOR_GREEN, 1);
-    init_car(&enemies[0], -0.3, COLOR_RED, 0);
-    init_car(&enemies[1], -0.6, COLOR_MAGENTA, 0);
-    init_car(&enemies[2], -0.9, COLOR_YELLOW, 0);
-    
-    start_time = time(NULL);
-    
-    clear_screen();
-    printf("\n\n        %sRACING GAME%s\n\n", COLOR_CYAN, COLOR_RESET);
-    printf("        Complete %d laps to win!\n", LAPS_TO_WIN);
-    printf("        Press any key to start...\n\n");
-    getchar();
-    
-    start_time = time(NULL);
-    
-    // Game loop
-    while(!game_over) {
-        init_screen();
-        draw_track();
-        
-        // Handle input
-        if(kbhit()) {
-            char key = get_key();
-            switch(key) {
-                case 'w':
-                case 'W':
-                    player.speed += 0.3;
-                    if(player.speed > 2.0) player.speed = 2.0;
-                    break;
-                case 's':
-                case 'S':
-                    player.speed -= 0.3;
-                    if(player.speed < -1.0) player.speed = -1.0;
-                    break;
-                case 'a':
-                case 'A':
-                    player.angle -= 0.2;
-                    break;
-                case 'd':
-                case 'D':
-                    player.angle += 0.2;
-                    break;
-                case 'q':
-                case 'Q':
-                    game_over = 1;
-                    break;
+    /* Enemies */
+    for (i = 0; i < num_enemies; i++) {
+        if (!enemies[i].finished) {
+            int ex = enemies[i].pos.x;
+            int ey = enemies[i].pos.y;
+            if (ex >= 0 && ex < MAP_W && ey >= 0 && ey < MAP_H) {
+                disp[ey][ex] = enemies[i].symbol;
             }
         }
-        
-        // Update game state
-        update_car(&player, 1);
-        for(int i = 0; i < MAX_ENEMIES; i++) {
-            update_car(&enemies[i], 0);
-        }
-        
-        // Draw cars
-        draw_car(&player);
-        for(int i = 0; i < MAX_ENEMIES; i++) {
-            draw_car(&enemies[i]);
-        }
-        
-        // Render
-        render();
-        
-        sleep_ms(50);
     }
-    
-    // Show victory/defeat screen
-    show_victory_screen();
-    
+
+    /* Player */
+    if (!player->finished) {
+        if (player->x >= 0 && player->x < MAP_W &&
+            player->y >= 0 && player->y < MAP_H) {
+            disp[player->y][player->x] = 'P';
+        }
+    }
+
+    /* Print the map below the HUD */
+    for (y = 0; y < MAP_H; y++) {
+        for (x = 0; x < MAP_W; x++) {
+            putchar(disp[y][x]);
+        }
+        putchar('\n');
+    }
+    fflush(stdout);
+}
+
+/* --------- Game logic helpers --------- */
+
+static void process_player_input(Player *player, int *running, int *player_quit) {
+    int ch;
+
+    while ((ch = read_key()) != -1) {
+        if (ch == 'q' || ch == 'Q') {
+            *running = 0;
+            *player_quit = 1;
+            break;
+        }
+
+        ch = toupper(ch);
+        int dx = 0, dy = 0;
+
+        if (ch == 'W') dy = -1;
+        else if (ch == 'S') dy = 1;
+        else if (ch == 'A') dx = -1;
+        else if (ch == 'D') dx = 1;
+        else continue; /* ignore other keys */
+
+        int nx = player->x + dx;
+        int ny = player->y + dy;
+
+        if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) {
+            continue;
+        }
+
+        char tile = base_map[ny][nx];
+        if (tile == '.' || tile == 'S' || tile == 'C') {
+            player->x = nx;
+            player->y = ny;
+        }
+    }
+}
+
+static void update_player_lap(Player *player, double elapsed) {
+    if (player->x == checkpoint_x && player->y == checkpoint_y) {
+        player->passed_checkpoint = 1;
+    }
+
+    if (player->x == start_x && player->y == start_y) {
+        if (!player->on_start && player->passed_checkpoint) {
+            player->laps++;
+            player->passed_checkpoint = 0;
+            if (!player->finished && player->laps >= LAPS_TO_WIN) {
+                player->finished = 1;
+                player->finish_time = elapsed;
+            }
+        }
+        player->on_start = 1;
+    } else {
+        player->on_start = 0;
+    }
+}
+
+static void update_enemies(EnemyCar enemies[], int num_enemies, double elapsed) {
+    int i;
+    for (i = 0; i < num_enemies; i++) {
+        EnemyCar *e = &enemies[i];
+
+        if (e->finished) continue;
+
+        e->move_counter++;
+        if (e->move_counter < e->move_delay) {
+            continue;
+        }
+        e->move_counter = 0;
+
+        /* Move along path */
+        e->path_index = (e->path_index + 1) % path_len;
+        e->pos = path[e->path_index];
+
+        /* Lap counting: first time crossing index 0 just "start"; afterward laps */
+        if (e->path_index == 0) {
+            if (e->started) {
+                e->laps++;
+                if (!e->finished && e->laps >= LAPS_TO_WIN) {
+                    e->finished = 1;
+                    e->finish_time = elapsed;
+                }
+            } else {
+                e->started = 1;
+            }
+        }
+    }
+}
+
+/* --------- Main --------- */
+
+int main(void) {
+    enable_raw_mode();
+    atexit(disable_raw_mode);
+
+    /* Clear screen, move home, hide cursor */
+    printf("\033[2J\033[H\033[?25l");
+    fflush(stdout);
+
+    generate_track();
+
+    Player player;
+    player.x = start_x;
+    player.y = start_y;
+    player.laps = 0;
+    player.passed_checkpoint = 0;
+    player.on_start = 1; /* we start on the start line */
+    player.finished = 0;
+    player.finish_time = -1.0;
+
+    EnemyCar enemies[MAX_ENEMIES];
+    int num_enemies = MAX_ENEMIES;
+
+    /* Place enemies at different positions on the path */
+    int i;
+    for (i = 0; i < num_enemies; i++) {
+        int idx = (i + 1) * path_len / (num_enemies + 1);
+        enemies[i].path_index = idx % path_len;
+        enemies[i].pos = path[enemies[i].path_index];
+        enemies[i].laps = 0;
+        enemies[i].started = 0;
+        enemies[i].finished = 0;
+        enemies[i].finish_time = -1.0;
+        enemies[i].move_counter = 0;
+        enemies[i].move_delay = 2 + i; /* slightly different speeds */
+        enemies[i].symbol = '1' + i;
+    }
+
+    double start_time = get_time_sec();
+    int running = 1;
+    int player_quit = 0;
+
+    int frame_time_us = 1000000 / TARGET_FPS;
+
+    while (running) {
+        double now = get_time_sec();
+        double elapsed = now - start_time;
+
+        process_player_input(&player, &running, &player_quit);
+        if (!running) break;
+
+        if (!player.finished) {
+            update_player_lap(&player, elapsed);
+        }
+
+        update_enemies(enemies, num_enemies, elapsed);
+
+        /* Check race end conditions */
+        int any_enemy_finished = 0;
+        double best_enemy_finish = -1.0;
+
+        for (i = 0; i < num_enemies; i++) {
+            if (enemies[i].finished) {
+                any_enemy_finished = 1;
+                if (best_enemy_finish < 0 ||
+                    enemies[i].finish_time < best_enemy_finish) {
+                    best_enemy_finish = enemies[i].finish_time;
+                }
+            }
+        }
+
+        int player_finished = player.finished;
+
+        int game_over = 0;
+        int player_won = 0;
+
+        if (player_finished && !any_enemy_finished) {
+            game_over = 1;
+            player_won = 1;
+        } else if (any_enemy_finished && !player_finished) {
+            game_over = 1;
+            player_won = 0;
+        } else if (any_enemy_finished && player_finished) {
+            game_over = 1;
+            if (player.finish_time <= best_enemy_finish) {
+                player_won = 1;
+            } else {
+                player_won = 0;
+            }
+        }
+
+        draw_game(&player, enemies, num_enemies, elapsed);
+
+        if (game_over) {
+            running = 0;
+            /* Store result flags for victory screen via locals */
+            /* We'll reconstruct from player/enemy state after loop. */
+            /* Break out after a short delay so last frame is visible. */
+            usleep(300000);
+            break;
+        }
+
+        usleep(frame_time_us);
+    }
+
+    /* Restore cursor and terminal */
+    printf("\033[?25h");
+    fflush(stdout);
+    disable_raw_mode();
+
+    /* Victory / end screen */
+    printf("\033[2J\033[H");
+
+    if (player_quit) {
+        printf("You quit the race.\n");
+        printf("Thanks for playing.\n");
+        return 0;
+    }
+
+    /* Determine final result again for clarity */
+    int any_enemy_finished = 0;
+    double best_enemy_finish = -1.0;
+    int best_enemy_index = -1;
+
+    for (i = 0; i < num_enemies; i++) {
+        if (enemies[i].finished) {
+            any_enemy_finished = 1;
+            if (best_enemy_finish < 0 ||
+                enemies[i].finish_time < best_enemy_finish) {
+                best_enemy_finish = enemies[i].finish_time;
+                best_enemy_index = i;
+            }
+        }
+    }
+
+    int player_finished = player.finished;
+    int player_won = 0;
+    if (player_finished && !any_enemy_finished) {
+        player_won = 1;
+    } else if (!player_finished && any_enemy_finished) {
+        player_won = 0;
+    } else if (any_enemy_finished && player_finished) {
+        if (player.finish_time <= best_enemy_finish) {
+            player_won = 1;
+        } else {
+            player_won = 0;
+        }
+    } else {
+        /* No one finished: treat as DNF */
+        player_won = 0;
+    }
+
+    char time_buf[64];
+    double final_time = player_finished ? player.finish_time : (get_time_sec() - start_time);
+    format_time(final_time, time_buf, sizeof(time_buf));
+
+    if (player_won) {
+        printf("========================================\n");
+        printf("               YOU WIN!                 \n");
+        printf("========================================\n\n");
+    } else {
+        printf("========================================\n");
+        printf("               YOU LOSE                 \n");
+        printf("========================================\n\n");
+    }
+
+    printf("Your laps: %d/%d  Time: %s\n", player.laps, LAPS_TO_WIN, time_buf);
+
+    for (i = 0; i < num_enemies; i++) {
+        char e_time[64];
+        double t = enemies[i].finished ? enemies[i].finish_time : final_time;
+        format_time(t, e_time, sizeof(e_time));
+        printf("Enemy %c: laps %d/%d  Time: %s%s\n",
+               enemies[i].symbol,
+               enemies[i].laps, LAPS_TO_WIN,
+               e_time,
+               enemies[i].finished ? "" : " (DNF)");
+    }
+
+    if (best_enemy_index >= 0) {
+        printf("\nFastest enemy: %c\n", enemies[best_enemy_index].symbol);
+    }
+
+    printf("\nPress Enter to exit...");
+    fflush(stdout);
+    /* Wait for Enter */
+    int c;
+    do {
+        c = getchar();
+    } while (c != '\n' && c != EOF);
+
     return 0;
 }
