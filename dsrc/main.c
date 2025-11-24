@@ -1,289 +1,292 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
+
+#ifdef _WIN32
+#include <conio.h>
+#include <windows.h>
+#else
 #include <unistd.h>
 #include <termios.h>
 #include <fcntl.h>
-#include <math.h>
+#endif
 
 #define WIDTH 70
-#define HEIGHT 25
-#define MAX_ENEMIES 3
+#define HEIGHT 28
 #define TOTAL_LAPS 3
-#define FPS 20
-
-// ANSI escape codes
-#define CLEAR_SCREEN "\033[2J"
-#define HIDE_CURSOR "\033[?25l"
-#define SHOW_CURSOR "\033[?25h"
-#define MOVE_CURSOR(x, y) printf("\033[%d;%dH", (y), (x))
+#define NUM_ENEMIES 3
 
 typedef struct {
     float x, y;
-    float vx, vy;
-    int laps;
+    float angle;
+    float speed;
+    int lap;
     int checkpoint;
 } Car;
 
-char track[HEIGHT][WIDTH];
+char screen[HEIGHT][WIDTH];
 Car player;
-Car enemies[MAX_ENEMIES];
-int game_running = 1;
+Car enemies[NUM_ENEMIES];
 time_t start_time;
-struct termios orig_termios;
+int game_over = 0;
+int won = 0;
 
-void disable_raw_mode() {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-    printf(SHOW_CURSOR);
-}
-
-void enable_raw_mode() {
-    tcgetattr(STDIN_FILENO, &orig_termios);
-    atexit(disable_raw_mode);
-    struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-    printf(HIDE_CURSOR);
-}
-
+#ifdef _WIN32
+void sleep_ms(int ms) { Sleep(ms); }
+int kbhit() { return _kbhit(); }
+char get_input() { return _getch(); }
+#else
+void sleep_ms(int ms) { usleep(ms * 1000); }
 int kbhit() {
-    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-    int ch = getchar();
-    fcntl(STDIN_FILENO, F_SETFL, flags);
-    return ch;
+    struct termios oldt, newt;
+    int ch, oldf;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
+    ch = getchar();
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    fcntl(STDIN_FILENO, F_SETFL, oldf);
+    if(ch != EOF) { ungetc(ch, stdin); return 1; }
+    return 0;
 }
+char get_input() { return getchar(); }
+#endif
 
-void init_track() {
-    // Fill with grass
-    for (int y = 0; y < HEIGHT; y++)
-        for (int x = 0; x < WIDTH; x++)
-            track[y][x] = '.';
+void clear_screen() { printf("\033[2J\033[H"); }
+
+void draw_track() {
+    for (int i = 0; i < HEIGHT; i++)
+        for (int j = 0; j < WIDTH; j++)
+            screen[i][j] = ' ';
     
-    // Draw oval track
-    for (int y = 3; y < HEIGHT - 3; y++) {
-        for (int x = 5; x < WIDTH - 5; x++) {
-            int dx = (x < WIDTH/2) ? x - 10 : x - (WIDTH - 10);
-            int dy = y - HEIGHT/2;
-            int outer = dx*dx/400 + dy*dy/80;
-            int inner = dx*dx/200 + dy*dy/40;
-            
-            if (outer <= 1 && inner > 1) {
-                track[y][x] = ' ';
-            } else if (outer <= 1 && inner <= 1) {
-                track[y][x] = '#';
-            }
-        }
+    // Figure-8 track with two circles connected
+    float cx1 = 20, cy1 = 14;  // Left circle center
+    float cx2 = 50, cy2 = 14;  // Right circle center
+    float r_outer = 10, r_inner = 7;
+    
+    // Draw left circle
+    for (float a = 0; a < 2 * M_PI; a += 0.02) {
+        int x1 = (int)(cx1 + cos(a) * r_outer);
+        int y1 = (int)(cy1 + sin(a) * r_outer);
+        int x2 = (int)(cx1 + cos(a) * r_inner);
+        int y2 = (int)(cy1 + sin(a) * r_inner);
+        if (x1 >= 0 && x1 < WIDTH && y1 >= 0 && y1 < HEIGHT) screen[y1][x1] = '#';
+        if (x2 >= 0 && x2 < WIDTH && y2 >= 0 && y2 < HEIGHT) screen[y2][x2] = '#';
     }
     
-    // Draw outer walls
-    for (int y = 3; y < HEIGHT - 3; y++) {
-        for (int x = 5; x < WIDTH - 5; x++) {
-            int dx = (x < WIDTH/2) ? x - 10 : x - (WIDTH - 10);
-            int dy = y - HEIGHT/2;
-            int outer = dx*dx/400 + dy*dy/80;
-            if (outer >= 1 && outer <= 1.15) track[y][x] = '#';
-        }
+    // Draw right circle
+    for (float a = 0; a < 2 * M_PI; a += 0.02) {
+        int x1 = (int)(cx2 + cos(a) * r_outer);
+        int y1 = (int)(cy2 + sin(a) * r_outer);
+        int x2 = (int)(cx2 + cos(a) * r_inner);
+        int y2 = (int)(cy2 + sin(a) * r_inner);
+        if (x1 >= 0 && x1 < WIDTH && y1 >= 0 && y1 < HEIGHT) screen[y1][x1] = '#';
+        if (x2 >= 0 && x2 < WIDTH && y2 >= 0 && y2 < HEIGHT) screen[y2][x2] = '#';
     }
     
-    // Finish line
-    for (int i = 0; i < 4; i++)
-        track[HEIGHT/2 - 2 + i][12] = '=';
+    // Draw start/finish line
+    for (int i = 0; i < 4; i++) {
+        int x = 20 + r_inner;
+        int y = 14 - 2 + i;
+        if (y >= 0 && y < HEIGHT && x < WIDTH) screen[y][x] = '|';
+    }
 }
 
-int is_on_track(int x, int y) {
-    if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) return 0;
-    return (track[y][x] == ' ' || track[y][x] == '=');
+int is_on_track(float x, float y) {
+    int ix = (int)(x + 0.5);
+    int iy = (int)(y + 0.5);
+    if (ix <= 0 || ix >= WIDTH-1 || iy <= 0 || iy >= HEIGHT-1) return 0;
+    
+    // Check if we're hitting a wall
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            int cx = ix + dx, cy = iy + dy;
+            if (cx >= 0 && cx < WIDTH && cy >= 0 && cy < HEIGHT)
+                if (screen[cy][cx] == '#') return 0;
+        }
+    return 1;
+}
+
+void update_checkpoint(Car *car) {
+    // Checkpoints to ensure lap is counted correctly
+    if (car->checkpoint == 0 && car->x > 35 && car->x < 45) {
+        car->checkpoint = 1;
+    } else if (car->checkpoint == 1 && car->x > 45) {
+        car->checkpoint = 2;
+    } else if (car->checkpoint == 2 && car->x < 35) {
+        car->checkpoint = 3;
+    } else if (car->checkpoint == 3 && car->x > 26 && car->x < 29 && 
+               car->y > 12 && car->y < 16) {
+        car->lap++;
+        car->checkpoint = 0;
+    }
 }
 
 void init_game() {
-    init_track();
-    player.x = 13; player.y = HEIGHT/2;
-    player.vx = 0; player.vy = 0;
-    player.laps = 0; player.checkpoint = 0;
+    player.x = 30; player.y = 14;
+    player.angle = 0; player.speed = 0;
+    player.lap = 0; player.checkpoint = 0;
     
-    for (int i = 0; i < MAX_ENEMIES; i++) {
-        enemies[i].x = 13;
-        enemies[i].y = HEIGHT/2 - 1 - i;
-        enemies[i].vx = 0.4;
-        enemies[i].vy = 0;
-        enemies[i].laps = 0;
+    for (int i = 0; i < NUM_ENEMIES; i++) {
+        enemies[i].x = 30 - (i + 1) * 4;
+        enemies[i].y = 14;
+        enemies[i].angle = 0;
+        enemies[i].speed = 0.25 + i * 0.08;
+        enemies[i].lap = 0;
         enemies[i].checkpoint = 0;
     }
+    
     start_time = time(NULL);
+    game_over = 0; won = 0;
 }
 
-void update_enemy(Car *e) {
-    float tx, ty;
-    
-    // Waypoints around track
-    if (e->checkpoint == 0) { tx = WIDTH - 15; ty = HEIGHT/2; }
-    else if (e->checkpoint == 1) { tx = WIDTH - 15; ty = HEIGHT - 7; }
-    else if (e->checkpoint == 2) { tx = 15; ty = HEIGHT - 7; }
-    else if (e->checkpoint == 3) { tx = 15; ty = 6; }
-    else { tx = 13; ty = HEIGHT/2; }
-    
-    float dx = tx - e->x;
-    float dy = ty - e->y;
-    float dist = sqrt(dx*dx + dy*dy);
-    
-    if (dist < 4) {
-        e->checkpoint = (e->checkpoint + 1) % 5;
-        if (e->checkpoint == 0) e->laps++;
+void update_player(char input) {
+    if (input == 'w' || input == 'W') {
+        player.speed += 0.08;
+        if (player.speed > 0.8) player.speed = 0.8;
     }
-    
-    if (dist > 0) {
-        e->vx = (dx / dist) * 0.5;
-        e->vy = (dy / dist) * 0.5;
+    if (input == 's' || input == 'S') {
+        player.speed -= 0.08;
+        if (player.speed < -0.4) player.speed = -0.4;
     }
+    if (input == 'a' || input == 'A') player.angle -= 0.12;
+    if (input == 'd' || input == 'D') player.angle += 0.12;
     
-    float nx = e->x + e->vx;
-    float ny = e->y + e->vy;
-    if (is_on_track((int)nx, (int)ny)) {
-        e->x = nx; e->y = ny;
-    }
-}
-
-void handle_input() {
-    int ch = kbhit();
-    if (ch == 'w' || ch == 'W') player.vy -= 0.3;
-    if (ch == 's' || ch == 'S') player.vy += 0.3;
-    if (ch == 'a' || ch == 'A') player.vx -= 0.3;
-    if (ch == 'd' || ch == 'D') player.vx += 0.3;
-    if (ch == 'q' || ch == 'Q') game_running = 0;
+    player.speed *= 0.96;
     
-    player.vx *= 0.85;
-    player.vy *= 0.85;
+    float new_x = player.x + cos(player.angle) * player.speed;
+    float new_y = player.y + sin(player.angle) * player.speed;
     
-    float speed = sqrt(player.vx*player.vx + player.vy*player.vy);
-    if (speed > 1.2) {
-        player.vx = (player.vx / speed) * 1.2;
-        player.vy = (player.vy / speed) * 1.2;
-    }
-}
-
-void update_player() {
-    float nx = player.x + player.vx;
-    float ny = player.y + player.vy;
-    
-    if (is_on_track((int)nx, (int)ny)) {
-        player.x = nx; player.y = ny;
-        
-        // Checkpoint detection
-        if (player.checkpoint == 0 && player.x > WIDTH/2 && player.y < HEIGHT/2) {
-            player.checkpoint = 1;
-        } else if (player.checkpoint == 1 && player.x > WIDTH/2 && player.y > HEIGHT/2) {
-            player.checkpoint = 2;
-        } else if (player.checkpoint == 2 && player.x < WIDTH/2 && player.y > HEIGHT/2) {
-            player.checkpoint = 3;
-        } else if (player.checkpoint == 3 && player.x < WIDTH/2 && player.y < HEIGHT/2) {
-            player.checkpoint = 0;
-            player.laps++;
-        }
+    if (is_on_track(new_x, new_y)) {
+        player.x = new_x;
+        player.y = new_y;
     } else {
-        player.vx *= -0.3;
-        player.vy *= -0.3;
+        player.speed *= -0.4;
+    }
+    
+    update_checkpoint(&player);
+    if (player.lap >= TOTAL_LAPS) { game_over = 1; won = 1; }
+}
+
+void update_enemies() {
+    for (int i = 0; i < NUM_ENEMIES; i++) {
+        Car *e = &enemies[i];
+        float tx, ty;
+        
+        if (e->checkpoint <= 1) { tx = 50; ty = 14; }
+        else { tx = 30; ty = 14; }
+        
+        float target_angle = atan2(ty - e->y, tx - e->x);
+        float diff = target_angle - e->angle;
+        while (diff > M_PI) diff -= 2 * M_PI;
+        while (diff < -M_PI) diff += 2 * M_PI;
+        e->angle += diff * 0.08;
+        
+        float new_x = e->x + cos(e->angle) * e->speed;
+        float new_y = e->y + sin(e->angle) * e->speed;
+        
+        if (is_on_track(new_x, new_y)) {
+            e->x = new_x;
+            e->y = new_y;
+        } else {
+            e->angle += 0.5;
+        }
+        
+        update_checkpoint(e);
     }
 }
 
-void draw_initial() {
-    printf(CLEAR_SCREEN);
-    MOVE_CURSOR(1, 1);
-    for (int y = 0; y < HEIGHT; y++) {
-        for (int x = 0; x < WIDTH; x++) {
-            putchar(track[y][x]);
+void render() {
+    clear_screen();
+    draw_track();
+    
+    for (int i = 0; i < NUM_ENEMIES; i++) {
+        int ex = (int)(enemies[i].x + 0.5);
+        int ey = (int)(enemies[i].y + 0.5);
+        if (ex > 0 && ex < WIDTH-1 && ey > 0 && ey < HEIGHT-1)
+            screen[ey][ex] = 'E';
+    }
+    
+    int px = (int)(player.x + 0.5);
+    int py = (int)(player.y + 0.5);
+    if (px > 0 && px < WIDTH-1 && py > 0 && py < HEIGHT-1)
+        screen[py][px] = 'P';
+    
+    for (int i = 0; i < HEIGHT; i++) {
+        for (int j = 0; j < WIDTH; j++) {
+            char c = screen[i][j];
+            if (c == '#') printf("\033[32m#\033[0m");
+            else if (c == 'P') printf("\033[33mP\033[0m");
+            else if (c == 'E') printf("\033[31mE\033[0m");
+            else if (c == '|') printf("\033[37m|\033[0m");
+            else printf(" ");
         }
-        putchar('\n');
-    }
-    printf("\nControls: WASD to move | Q to quit\n");
-    printf("Status: ");
-    fflush(stdout);
-}
-
-void update_screen() {
-    static int old_px = -1, old_py = -1;
-    static int old_ex[MAX_ENEMIES], old_ey[MAX_ENEMIES];
-    
-    // Clear old positions
-    if (old_px >= 0 && old_py >= 0) {
-        MOVE_CURSOR(old_px + 1, old_py + 1);
-        putchar(track[old_py][old_px]);
+        printf("\n");
     }
     
-    for (int i = 0; i < MAX_ENEMIES; i++) {
-        if (old_ex[i] >= 0 && old_ey[i] >= 0) {
-            MOVE_CURSOR(old_ex[i] + 1, old_ey[i] + 1);
-            putchar(track[old_ey[i]][old_ex[i]]);
-        }
-    }
-    
-    // Draw enemies
-    for (int i = 0; i < MAX_ENEMIES; i++) {
-        old_ex[i] = (int)enemies[i].x;
-        old_ey[i] = (int)enemies[i].y;
-        MOVE_CURSOR(old_ex[i] + 1, old_ey[i] + 1);
-        printf("\033[31mE\033[0m"); // Red enemy
-    }
-    
-    // Draw player
-    old_px = (int)player.x;
-    old_py = (int)player.y;
-    MOVE_CURSOR(old_px + 1, old_py + 1);
-    printf("\033[32mP\033[0m"); // Green player
-    
-    // Update status
-    int elapsed = (int)(time(NULL) - start_time);
-    MOVE_CURSOR(9, HEIGHT + 3);
-    printf("Lap %d/%d | Time %02d:%02d | Speed %.0f%%   ",
-           player.laps, TOTAL_LAPS, elapsed/60, elapsed%60,
-           sqrt(player.vx*player.vx + player.vy*player.vy) / 1.2 * 100);
-    fflush(stdout);
+    time_t now = time(NULL);
+    int elapsed = (int)(now - start_time);
+    printf("\n\033[36mLap: %d/%d | Time: %02d:%02d | Speed: %.1f | [WASD]=Move [Q]=Quit\033[0m\n",
+           player.lap, TOTAL_LAPS, elapsed / 60, elapsed % 60, player.speed * 10);
 }
 
 void show_victory() {
-    int total = (int)(time(NULL) - start_time);
-    printf(CLEAR_SCREEN);
-    MOVE_CURSOR(1, 5);
-    printf("\n");
-    printf("    ╔══════════════════════════════════╗\n");
-    printf("    ║                                  ║\n");
-    printf("    ║      🏁 RACE COMPLETE! 🏁        ║\n");
-    printf("    ║                                  ║\n");
-    printf("    ║     Total Time: %02d:%02d          ║\n", total/60, total%60);
-    printf("    ║                                  ║\n");
-    printf("    ║       Great driving!             ║\n");
-    printf("    ║                                  ║\n");
-    printf("    ╚══════════════════════════════════╝\n");
+    clear_screen();
+    int elapsed = (int)(time(NULL) - start_time);
+    printf("\n\n\n");
+    printf("          \033[33m╔════════════════════════════════╗\033[0m\n");
+    printf("          \033[33m║                                ║\033[0m\n");
+    printf("          \033[33m║       🏁  VICTORY!  🏁        ║\033[0m\n");
+    printf("          \033[33m║                                ║\033[0m\n");
+    printf("          \033[33m║   You completed %d laps!       ║\033[0m\n", TOTAL_LAPS);
+    printf("          \033[33m║                                ║\033[0m\n");
+    printf("          \033[33m║   Final Time: %02d:%02d           ║\033[0m\n", elapsed/60, elapsed%60);
+    printf("          \033[33m║                                ║\033[0m\n");
+    printf("          \033[33m╚════════════════════════════════╝\033[0m\n");
     printf("\n\n");
-    fflush(stdout);
-    sleep(4);
 }
 
 int main() {
-    enable_raw_mode();
+    printf("\033[36m=== FIGURE-8 RACING ===\033[0m\n");
+    printf("Complete %d laps around the figure-8 track!\n", TOTAL_LAPS);
+    printf("Controls: W=Forward, S=Brake, A=Left, D=Right, Q=Quit\n");
+    printf("Press ENTER to start...\n");
+    getchar();
+    
+    #ifndef _WIN32
+    struct termios oldt, newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    #endif
+    
     init_game();
-    draw_initial();
     
-    struct timespec sleep_time = {0, 1000000000 / FPS};
-    
-    while (game_running && player.laps < TOTAL_LAPS) {
-        handle_input();
-        update_player();
-        for (int i = 0; i < MAX_ENEMIES; i++)
-            update_enemy(&enemies[i]);
-        update_screen();
-        nanosleep(&sleep_time, NULL);
+    while (!game_over) {
+        char input = 0;
+        if (kbhit()) {
+            input = get_input();
+            if (input == 'q' || input == 'Q') break;
+        }
+        
+        update_player(input);
+        update_enemies();
+        render();
+        sleep_ms(40);
     }
     
-    if (player.laps >= TOTAL_LAPS)
-        show_victory();
+    #ifndef _WIN32
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    #endif
     
-    disable_raw_mode();
-    printf(CLEAR_SCREEN);
-    MOVE_CURSOR(1, 1);
-    printf("Thanks for playing!\n");
+    if (won) show_victory();
+    printf("\n\033[36mThanks for playing!\033[0m\n\n");
+    
     return 0;
 }
