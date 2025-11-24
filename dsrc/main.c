@@ -1,225 +1,107 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <math.h>
-#include <time.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#include <conio.h>
-#else
 #include <unistd.h>
 #include <termios.h>
 #include <fcntl.h>
-#endif
 
-#define WIDTH 80
-#define HEIGHT 24
-#define ROAD_SEGMENTS 100
-#define DRAW_DISTANCE 50
+#define COLS 80          // road width
+#define ROWS 35          // screen height (road + sky)
 
-typedef struct {
-    float curve;
-    float y;
-} Segment;
-
-char screen[HEIGHT][WIDTH];
-Segment road[ROAD_SEGMENTS];
-float playerX = 0;
-float position = 0;
-float speed = 0;
+double pos = 0.0;        // distance along track
+double speed = 0.0;      // current speed
+double player_x = 0.0;   // lateral position (-50...50 approx)
 int score = 0;
 
-void clearScreen() {
-#ifdef _WIN32
-    system("cls");
-#else
-    printf("\033[2J\033[H");
-#endif
-}
-
-void initTerminal() {
-#ifndef _WIN32
-    struct termios term;
-    tcgetattr(0, &term);
-    term.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(0, TCSANOW, &term);
-    fcntl(0, F_SETFL, fcntl(0, F_GETFL) | O_NONBLOCK);
-#endif
-}
-
-void resetTerminal() {
-#ifndef _WIN32
-    struct termios term;
-    tcgetattr(0, &term);
-    term.c_lflag |= (ICANON | ECHO);
-    tcsetattr(0, TCSANOW, &term);
-    fcntl(0, F_SETFL, fcntl(0, F_GETFL) & ~O_NONBLOCK);
-#endif
-}
-
-int getKey() {
-#ifdef _WIN32
-    if (_kbhit()) return _getch();
-    return 0;
-#else
-    int ch = getchar();
-    return (ch == EOF) ? 0 : ch;
-#endif
-}
-
-void initRoad() {
-    for (int i = 0; i < ROAD_SEGMENTS; i++) {
-        road[i].y = 0;
-        road[i].curve = 0;
-        
-        if (i > 0) {
-            road[i].y = road[i-1].y + 100;
-            
-            if (i % 20 == 0) {
-                road[i].curve = (rand() % 3 - 1) * 2.0f;
-            } else {
-                road[i].curve = road[i-1].curve;
-            }
-        }
-    }
-}
-
-void drawScreen() {
-    memset(screen, ' ', sizeof(screen));
-    
-    int startPos = (int)position / 100;
-    float camX = playerX;
-    
-    for (int n = 0; n < DRAW_DISTANCE; n++) {
-        int segIdx = (startPos + n) % ROAD_SEGMENTS;
-        Segment *seg = &road[segIdx];
-        
-        float perspective = (float)(n + 1) / DRAW_DISTANCE;
-        float roadY = HEIGHT - 1 - (int)(perspective * HEIGHT * 0.5f);
-        
-        if (roadY < 0 || roadY >= HEIGHT) continue;
-        
-        float roadWidth = 0.1f + perspective * 0.8f;
-        float clipWidth = roadWidth * 0.15f;
-        
-        float curvature = 0;
-        for (int i = startPos; i < startPos + n; i++) {
-            curvature += road[i % ROAD_SEGMENTS].curve * 0.02f;
-        }
-        
-        float roadCenter = WIDTH / 2.0f + curvature * (1.0f - perspective) * WIDTH * 0.3f;
-        float leftGrass = roadCenter - roadWidth * WIDTH / 2.0f;
-        float leftEdge = roadCenter - roadWidth * WIDTH / 2.0f + clipWidth * WIDTH;
-        float rightEdge = roadCenter + roadWidth * WIDTH / 2.0f - clipWidth * WIDTH;
-        float rightGrass = roadCenter + roadWidth * WIDTH / 2.0f;
-        
-        int y = (int)roadY;
-        if (y >= 0 && y < HEIGHT) {
-            for (int x = 0; x < WIDTH; x++) {
-                char c = ' ';
-                
-                if (x < leftGrass || x > rightGrass) {
-                    c = (n % 3 == 0) ? ',' : '.';
-                } else if (x < leftEdge || x > rightEdge) {
-                    c = (n % 2 == 0) ? '#' : '|';
-                } else {
-                    int stripe = ((int)(position + n * 10)) % 40;
-                    if (x > roadCenter - 2 && x < roadCenter + 2) {
-                        c = (stripe < 10) ? '|' : ' ';
-                    } else {
-                        c = (n % 2 == 0) ? 177 : 176;
-                    }
-                }
-                
-                screen[y][x] = c;
-            }
-        }
-    }
-    
-    int carY = HEIGHT - 4;
-    int carX = WIDTH / 2 + (int)(playerX * WIDTH / 4);
-    
-    if (carX >= 1 && carX < WIDTH - 2 && carY >= 2 && carY < HEIGHT - 1) {
-        screen[carY - 2][carX] = 'o';
-        screen[carY - 1][carX - 1] = '/';
-        screen[carY - 1][carX] = '|';
-        screen[carY - 1][carX + 1] = '\\';
-        screen[carY][carX - 1] = '=';
-        screen[carY][carX] = 'H';
-        screen[carY][carX + 1] = '=';
-        screen[carY + 1][carX - 1] = 'O';
-        screen[carY + 1][carX + 1] = 'O';
-    }
-    
-    clearScreen();
-    for (int y = 0; y < HEIGHT; y++) {
-        for (int x = 0; x < WIDTH; x++) {
-            putchar(screen[y][x]);
-        }
-        putchar('\n');
-    }
-    
-    printf("Speed: %3.0f  Score: %d  Pos: %.0f\n", speed * 100, score, position);
-    printf("Controls: A/D or Arrow Keys to steer, W/S for speed, Q to quit\n");
+void enable_raw_mode() {
+    struct termios raw;
+    tcgetattr(0, &raw);
+    raw.c_lflag &= ~(ECHO | ICANON);
+    tcsetattr(0, TCSANOW, &raw);
+    int flags = fcntl(0, F_GETFL, 0);
+    fcntl(0, F_SETFL, flags | O_NONBLOCK);
 }
 
 int main() {
-    srand(time(NULL));
-    initTerminal();
-    initRoad();
-    
-    speed = 0.5f;
-    int running = 1;
-    
-    clock_t lastTime = clock();
-    
-    while (running) {
-        clock_t currentTime = clock();
-        float deltaTime = (float)(currentTime - lastTime) / CLOCKS_PER_SEC;
-        lastTime = currentTime;
-        
-        if (deltaTime > 0.1f) deltaTime = 0.1f;
-        
-        int key = getKey();
-        if (key == 'q' || key == 'Q' || key == 27) {
-            running = 0;
+    enable_raw_mode();
+    printf("\033[?25l\033[2J");     // hide cursor, clear screen
+
+    while (1) {
+        // ----- input -----
+        int ch;
+        while ((ch = getchar()) != EOF) {
+            if (ch == 'a' || ch == 'A') player_x -= 1.5 + speed/30.0;  // harder at high speed
+            if (ch == 'd' || ch == 'D') player_x += 1.5 + speed/30.0;
+            if (ch == 'w' || ch == 'W') speed += 8.0;
+            if (ch == 's' || ch == 'S') speed = fmax(0.0, speed - 20.0);
+            if (ch == 'q' || ch == 'Q') goto end;
         }
-        if (key == 'a' || key == 'A' || key == 68) {
-            playerX -= 1.5f * deltaTime;
+
+        pos += speed / 20.0;
+        score += (int)speed / 5;
+        if (speed > 0) speed *= 0.99;   // slight drag
+
+        // ----- track definition (curves + hills) -----
+        double track_curve = sin(pos / 140.0) * 38.0;   // big lazy curves
+        double hill_height = sin(pos / 90.0) * 12.0;    // up/down hills
+
+        printf("\033[H");    // return to top-left
+
+        int horizon = (ROWS/3) + (int)hill_height;
+
+        // ----- render from bottom (near) to horizon (far) -----
+        for (int y = ROWS-1; y > horizon; y--) {
+            double perspective = (double)(ROWS - y) / (ROWS - horizon);   // 0 at horizon, ~1 at bottom
+            double curve_here   = track_curve * perspective * perspective; // curves bend realistically
+            double middle       = COLS/2 + curve_here + player_x * perspective * 1.8;
+
+            double road_width   = 6 + perspective * (COLS/2.4);
+
+            int left  = (int)(middle - road_width);
+            int right = (int)(middle + road_width);
+
+            for (int x = 0; x < COLS; x++) {
+                if (x >= left && x <= right) {
+                    // road surface with alternating stripes
+                    if (((int)(pos*3) + x) % 26 < 13)
+                        printf("░");
+                    else
+                        printf("▒");
+                } else {
+                    // grass/rumble
+                    printf("%c", (x % 4 == 0) ? '▓' : ' ');
+                }
+            }
+            printf("\n");
         }
-        if (key == 'd' || key == 'D' || key == 67) {
-            playerX += 1.5f * deltaTime;
+
+        // ----- sky -----
+        for (int y = horizon; y >= 0; y--) {
+            for (int x = 0; x < COLS; x++) printf(" ");
+            printf("\n");
         }
-        if (key == 'w' || key == 'W') {
-            speed += 0.5f * deltaTime;
-            if (speed > 1.5f) speed = 1.5f;
+
+        // ----- draw your car (fixed at bottom center) -----
+        int car_x = COLS / 2;
+        printf("\033[%d;%dH  \033[91m███\033[0m  ", ROWS-4, car_x-4);
+        printf("\033[%d;%dH\033[91m████████\033[0m", ROWS-5, car_x-4);
+        printf("\033[%d;%dH \033[91m██\033[0m██\033[91m██\033[0m ", ROWS-6, car_x-4);
+
+        // ----- off-road detection & slowdown -----
+        double bottom_middle = COLS/2 + track_curve + player_x * 1.8;
+        double bottom_width  = COLS/2.4;
+        if (fabs(car_x - bottom_middle) > bottom_width + 6) {
+            speed *= 0.6;
+            printf("\033[%d;1H\033[91mOFF ROAD!!!\033[0m", ROWS+1);
         }
-        if (key == 's' || key == 'S') {
-            speed -= 0.5f * deltaTime;
-            if (speed < 0.2f) speed = 0.2f;
-        }
-        
-        position += speed * 1000 * deltaTime;
-        score = (int)position / 10;
-        
-        if (playerX < -1.0f) playerX = -1.0f;
-        if (playerX > 1.0f) playerX = 1.0f;
-        
-        int segIdx = ((int)position / 100) % ROAD_SEGMENTS;
-        playerX += road[segIdx].curve * 0.001f * speed;
-        
-        drawScreen();
-        
-#ifdef _WIN32
-        Sleep(33);
-#else
-        usleep(33000);
-#endif
+
+        // ----- HUD -----
+        printf("\033[%d;1HSPEED: \033[93m%3.0f\033[0m    SCORE: \033[92m%d\033[0m    (A/D steer  W/S gas/brake  Q quit)", ROWS, speed, score);
+
+        usleep(30000);   // ~33 fps
     }
-    
-    resetTerminal();
-    printf("\n\nGame Over! Final Score: %d\n", score);
-    
+
+end:
+    printf("\033[?25h\033[2J");   // show cursor, clear
+    printf("Game Over! Final score: %d\n", score);
     return 0;
 }
