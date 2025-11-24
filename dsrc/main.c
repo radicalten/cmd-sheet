@@ -1,379 +1,509 @@
-// Minimal single-file ASCII top-down racing game.
-// Compile with:  gcc -std=c99 -O2 -Wall -Wextra racer.c -lm -o racer
+/* ASCII Super Sprint-like top-down racer
+ * Single-file C, no external dependencies beyond standard C/POSIX.
+ *
+ * Tested/targeted for Linux/macOS terminals (ANSI escape + termios).
+ *
+ * Controls:
+ *   W = accelerate
+ *   S = brake / reverse
+ *   A = turn left
+ *   D = turn right
+ *   Q = quit
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <termios.h>
-#include <sys/select.h>
 #include <sys/time.h>
+#include <sys/select.h>
 #include <math.h>
-#include <string.h>
+#include <limits.h>
 
-#define MAP_W 40
-#define MAP_H 17
+#define WIDTH       60
+#define HEIGHT      20
+#define MAX_TRACK   (WIDTH * HEIGHT)
+#define MAX_ENEMIES 3
+#define MAX_LAPS    3
 
-#define FPS 30
-#define DT (1.0f / FPS)
+#define TICK_USEC   50000        /* 20 FPS (50 ms per frame) */
+#define ACCEL       18.0f        /* acceleration (cells/s^2) */
+#define FRICTION    0.90f        /* velocity damping per frame */
+#define TURN_SPEED  3.5f         /* radians per second */
+#define MAX_SPEED   20.0f        /* clamp speed (cells/s) */
 
-#define ACCELERATION 20.0f
-#define BRAKE_ACCEL 25.0f
-#define FRICTION 3.0f
-#define MAX_SPEED 12.0f
-#define TURN_RATE 3.5f
+#define PI          3.14159265f
 
-#define LAPS_TO_WIN 3
+#define LAP_STATE_BEFORE 0
+#define LAP_STATE_AFTER  1
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+typedef struct {
+    int x, y;
+} Node;
 
-// Track layout: '#' = wall, '.' = road, 'S' = start/finish line
-static const char TRACK[MAP_H][MAP_W + 1] = {
-    "########################################",
-    "#......................................#",
-    "#......................................#",
-    "#...################............####...#",
-    "#...#..............#............#..#...#",
-    "#...#..............#............#..#...#",
-    "#...#..............##########...#..#...#",
-    "#...#...........................#..#...#",
-    "#...#...........................#..#...#",
-    "#...#..............##########...#..#...#",
-    "#...#..............#............#..#...#",
-    "#...#..............#............#..#...#",
-    "#...################............####...#",
-    "#......................................#",
-    "#......................................#",
-    "#..................................S...#",
-    "########################################"
-};
+typedef struct {
+    float x, y;      /* position in grid coords (float) */
+    float vx, vy;    /* velocity components */
+    float angle;     /* heading in radians (0 = right, pi/2 = down) */
+    int   laps;
+    int   lap_state;
+    int   track_index; /* nearest track index for lap logic */
+} Player;
 
-// Terminal raw mode handling
+typedef struct {
+    float pos;       /* position along track (0..track_len) */
+    float speed;     /* cells per second */
+    int   laps;
+    int   lap_state;
+} Enemy;
+
+/* Global track data */
+static Node track[MAX_TRACK];
+static int  track_len = 0;
+
+/* Terminal raw mode */
 static struct termios orig_termios;
+static int raw_enabled = 0;
 
-void disable_raw_mode(void) {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-    // Show cursor again
-    printf("\x1b[?25h");
-    fflush(stdout);
+static void disable_raw_mode(void) {
+    if (raw_enabled) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        raw_enabled = 0;
+    }
 }
 
-void enable_raw_mode(void) {
-    tcgetattr(STDIN_FILENO, &orig_termios);
+static void enable_raw_mode(void) {
+    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) {
+        perror("tcgetattr");
+        exit(1);
+    }
     atexit(disable_raw_mode);
 
     struct termios raw = orig_termios;
     raw.c_lflag &= ~(ECHO | ICANON);
-    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VMIN]  = 0;
     raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-
-    // Hide cursor and clear screen
-    printf("\x1b[?25l");
-    printf("\x1b[2J");
-    printf("\x1b[H");
-    fflush(stdout);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
+        perror("tcsetattr");
+        exit(1);
+    }
+    raw_enabled = 1;
 }
 
-int kbhit(void) {
+static int read_key_nonblock(void) {
     struct timeval tv = {0L, 0L};
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(STDIN_FILENO, &fds);
-    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
-}
-
-int read_key(void) {
-    unsigned char c;
-    if (read(STDIN_FILENO, &c, 1) == 1) return c;
+    int r = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+    if (r > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
+        unsigned char c;
+        if (read(STDIN_FILENO, &c, 1) == 1)
+            return (int)c;
+    }
     return -1;
 }
 
-double now_sec(void) {
+static double current_time_sec(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return tv.tv_sec + tv.tv_usec * 1e-6;
+    return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
 }
 
-// Car state
-typedef struct {
-    float x, y;
-    float prev_x, prev_y;
-    float speed;
-    float angle;
-    int laps;
-    int finished;
-} Car;
-
-// Simple AI waypoints forming a big rectangle around the outer track
-#define NUM_WP 5
-static const float AI_WP[NUM_WP][2] = {
-    {32.5f, 15.5f}, // near start, inside
-    { 3.5f, 15.5f}, // bottom-left
-    { 3.5f,  1.5f}, // top-left
-    {36.5f,  1.5f}, // top-right
-    {36.5f, 15.5f}  // bottom-right
-};
-
-float normalize_angle(float a) {
-    while (a >  (float)M_PI) a -= 2.0f * (float)M_PI;
-    while (a < -(float)M_PI) a += 2.0f * (float)M_PI;
-    return a;
+static void clear_screen(void) {
+    /* ANSI clear screen */
+    printf("\x1b[2J");
 }
 
-// Integrate car physics, handle collisions and lap counting
-void move_car(Car *c, float accel_input, float turn_input,
-              float dt, int start_x, int start_y) {
-    c->prev_x = c->x;
-    c->prev_y = c->y;
+static void move_cursor_home(void) {
+    /* ANSI cursor to home */
+    printf("\x1b[H");
+}
 
-    // Throttle/brake input (-1..1)
-    if (accel_input > 0.0f) {
-        c->speed += ACCELERATION * dt * accel_input;
-    } else if (accel_input < 0.0f) {
-        c->speed += BRAKE_ACCEL * dt * accel_input; // accel_input is negative => braking
+/* Build a simple rectangular loop track inside the screen */
+static void build_track(void) {
+    int start_x = 5;
+    int end_x   = WIDTH - 6;
+    int top_y   = 3;
+    int bottom_y= HEIGHT - 4;
+
+    track_len = 0;
+
+    /* top edge left->right */
+    for (int x = start_x; x <= end_x; ++x)
+        track[track_len++] = (Node){x, top_y};
+
+    /* right edge top->bottom */
+    for (int y = top_y + 1; y <= bottom_y; ++y)
+        track[track_len++] = (Node){end_x, y};
+
+    /* bottom edge right->left */
+    for (int x = end_x - 1; x >= start_x; --x)
+        track[track_len++] = (Node){x, bottom_y};
+
+    /* left edge bottom->top (excluding corners already used) */
+    for (int y = bottom_y - 1; y > top_y; --y)
+        track[track_len++] = (Node){start_x, y};
+}
+
+static void set_road(char map[HEIGHT][WIDTH], int x, int y) {
+    if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+        if (map[y][x] != 'S') {
+            map[y][x] = '.';
+        }
+    }
+}
+
+/* Initialize map with walls and widen track around the central path */
+static void init_map(char map[HEIGHT][WIDTH]) {
+    for (int y = 0; y < HEIGHT; ++y) {
+        for (int x = 0; x < WIDTH; ++x) {
+            map[y][x] = '#';
+        }
     }
 
-    // Friction
-    if (c->speed > 0.0f) {
-        c->speed -= FRICTION * dt;
-        if (c->speed < 0.0f) c->speed = 0.0f;
+    for (int i = 0; i < track_len; ++i) {
+        int x = track[i].x;
+        int y = track[i].y;
+        set_road(map, x, y);
+        set_road(map, x + 1, y);
+        set_road(map, x - 1, y);
+        set_road(map, x, y + 1);
+        set_road(map, x, y - 1);
     }
 
-    // Clamp speed
-    if (c->speed > MAX_SPEED) c->speed = MAX_SPEED;
+    /* Start/finish line at track[0] */
+    Node s = track[0];
+    map[s.y][s.x] = 'S';
+}
 
-    // Steering (only when moving a bit)
-    if (c->speed > 0.5f) {
-        float turn_scale = 0.4f + 0.6f * (c->speed / MAX_SPEED);
-        c->angle += turn_input * TURN_RATE * dt * turn_scale;
-        c->angle = normalize_angle(c->angle);
+/* Find the closest track index to current float position */
+static int nearest_track_index(float fx, float fy) {
+    int col = (int)(fx + 0.5f);
+    int row = (int)(fy + 0.5f);
+
+    int best = 0;
+    int bestd = INT_MAX;
+    for (int i = 0; i < track_len; ++i) {
+        int dx = track[i].x - col;
+        int dy = track[i].y - row;
+        int d = dx * dx + dy * dy;
+        if (d < bestd) {
+            bestd = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void update_player(Player *p, char map[HEIGHT][WIDTH],
+                          float dt, int accel, int brake,
+                          int turn_left, int turn_right) {
+    /* Turning */
+    if (turn_left)
+        p->angle -= TURN_SPEED * dt;
+    if (turn_right)
+        p->angle += TURN_SPEED * dt;
+
+    float ax = 0.0f, ay = 0.0f;
+
+    if (accel) {
+        ax += cosf(p->angle) * ACCEL;
+        ay += sinf(p->angle) * ACCEL;
+    }
+    if (brake) {
+        ax -= cosf(p->angle) * ACCEL * 0.5f;
+        ay -= sinf(p->angle) * ACCEL * 0.5f;
     }
 
-    // Integrate position
-    float new_x = c->x + cosf(c->angle) * c->speed * dt;
-    float new_y = c->y + sinf(c->angle) * c->speed * dt;
+    p->vx += ax * dt;
+    p->vy += ay * dt;
 
-    int tile_x = (int)new_x;
-    int tile_y = (int)new_y;
+    /* Speed clamp */
+    float speed = sqrtf(p->vx * p->vx + p->vy * p->vy);
+    if (speed > MAX_SPEED) {
+        float scale = MAX_SPEED / speed;
+        p->vx *= scale;
+        p->vy *= scale;
+    }
+
+    /* Friction */
+    p->vx *= FRICTION;
+    p->vy *= FRICTION;
+
+    /* Proposed new position */
+    float newx = p->x + p->vx * dt;
+    float newy = p->y + p->vy * dt;
+
+    int col = (int)(newx + 0.5f);
+    int row = (int)(newy + 0.5f);
 
     int blocked = 0;
-    if (tile_x < 0 || tile_x >= MAP_W || tile_y < 0 || tile_y >= MAP_H) {
+    if (col < 0 || col >= WIDTH || row < 0 || row >= HEIGHT) {
         blocked = 1;
     } else {
-        char ch = TRACK[tile_y][tile_x];
-        if (ch == '#') blocked = 1; // walls only
+        char tile = map[row][col];
+        if (!(tile == '.' || tile == 'S'))
+            blocked = 1;
     }
 
     if (blocked) {
-        // Hit a wall: stop
-        c->speed = 0.0f;
+        /* Simple collision: bounce and do not move */
+        p->vx *= -0.3f;
+        p->vy *= -0.3f;
     } else {
-        c->x = new_x;
-        c->y = new_y;
+        p->x = newx;
+        p->y = newy;
     }
 
-    // Lap detection: crossing start line from right to left on its row
-    if (!c->finished) {
-        int prev_row = (int)c->prev_y;
-        int curr_row = (int)c->y;
-        if (prev_row == start_y && curr_row == start_y) {
-            float line_x = start_x + 0.5f;
-            if (c->prev_x > line_x && c->x <= line_x) {
-                c->laps++;
-                if (c->laps >= LAPS_TO_WIN)
-                    c->finished = 1;
-            }
+    /* Update nearest track index (for lap detection) */
+    p->track_index = nearest_track_index(p->x, p->y);
+}
+
+static void update_player_lap(Player *p) {
+    int half = track_len / 2;
+    int idx  = p->track_index;
+
+    if (p->lap_state == LAP_STATE_BEFORE && idx > half) {
+        p->lap_state = LAP_STATE_AFTER;
+    } else if (p->lap_state == LAP_STATE_AFTER && idx < half) {
+        p->laps++;
+        p->lap_state = LAP_STATE_BEFORE;
+    }
+}
+
+static void update_enemies(Enemy enemies[], int num, float dt) {
+    int half = track_len / 2;
+    for (int i = 0; i < num; ++i) {
+        enemies[i].pos += enemies[i].speed * dt;
+        /* Wrap around the track */
+        while (enemies[i].pos >= (float)track_len)
+            enemies[i].pos -= (float)track_len;
+        while (enemies[i].pos < 0.0f)
+            enemies[i].pos += (float)track_len;
+
+        int idx = ((int)enemies[i].pos) % track_len;
+        if (enemies[i].lap_state == LAP_STATE_BEFORE && idx > half) {
+            enemies[i].lap_state = LAP_STATE_AFTER;
+        } else if (enemies[i].lap_state == LAP_STATE_AFTER && idx < half) {
+            enemies[i].laps++;
+            enemies[i].lap_state = LAP_STATE_BEFORE;
         }
     }
 }
 
-void update_ai(Car *car, float dt, int start_x, int start_y, int *ai_wp_index) {
-    int idx = *ai_wp_index;
-    float tx = AI_WP[idx][0];
-    float ty = AI_WP[idx][1];
+static void render(const char map[HEIGHT][WIDTH],
+                   const Player *p,
+                   const Enemy enemies[], int num_enemies,
+                   double start_time) {
+    clear_screen();
+    move_cursor_home();
 
-    float dx = tx - car->x;
-    float dy = ty - car->y;
-    float dist = sqrtf(dx*dx + dy*dy);
+    double t = current_time_sec() - start_time;
+    if (t < 0) t = 0;
+    int total_sec = (int)t;
+    int min = total_sec / 60;
+    int sec = total_sec % 60;
+    int ms  = (int)((t - (double)total_sec) * 1000.0);
 
-    // Switch to next waypoint when close
-    if (dist < 1.5f) {
-        idx = (idx + 1) % NUM_WP;
-        *ai_wp_index = idx;
-        tx = AI_WP[idx][0];
-        ty = AI_WP[idx][1];
-        dx = tx - car->x;
-        dy = ty - car->y;
-        dist = sqrtf(dx*dx + dy*dy);
+    printf("ASCII Super Sprint   Laps: %d/%d   Time: %02d:%02d.%03d\n",
+           p->laps, MAX_LAPS, min, sec, ms);
+    printf("Controls: W=accel  S=brake  A/D=turn  Q=quit\n");
+
+    /* Player integer position and heading */
+    int p_col = (int)(p->x + 0.5f);
+    int p_row = (int)(p->y + 0.5f);
+
+    float a = fmodf(p->angle, 2.0f * PI);
+    if (a < 0.0f) a += 2.0f * PI;
+    char pch;
+    if (a >= 7.0f * PI / 4.0f || a < PI / 4.0f)
+        pch = '>';
+    else if (a < 3.0f * PI / 4.0f)
+        pch = 'v';
+    else if (a < 5.0f * PI / 4.0f)
+        pch = '<';
+    else
+        pch = '^';
+
+    int ex[MAX_ENEMIES], ey[MAX_ENEMIES];
+    for (int i = 0; i < num_enemies; ++i) {
+        int idx = ((int)enemies[i].pos) % track_len;
+        ex[i] = track[idx].x;
+        ey[i] = track[idx].y;
     }
 
-    float target_angle = atan2f(dy, dx);
-    float angle_diff = normalize_angle(target_angle - car->angle);
+    /* Draw map with overlayed cars */
+    for (int y = 0; y < HEIGHT; ++y) {
+        for (int x = 0; x < WIDTH; ++x) {
+            char c = map[y][x];
+            if (y == p_row && x == p_col) {
+                c = pch;
+            } else {
+                for (int i = 0; i < num_enemies; ++i) {
+                    if (y == ey[i] && x == ex[i]) {
+                        c = (char)('1' + i);
+                        break;
+                    }
+                }
+            }
+            putchar(c);
+        }
+        putchar('\n');
+    }
 
-    float turn_input = 0.0f;
-    if (angle_diff > 0.1f)      turn_input = 1.0f;
-    else if (angle_diff < -0.1f) turn_input = -1.0f;
-
-    float desired_speed = MAX_SPEED * 0.7f;
-    if (fabsf(angle_diff) > 0.6f)
-        desired_speed *= 0.4f; // slow down for sharp turns
-
-    float accel_input = 0.0f;
-    if (car->speed < desired_speed - 0.5f)
-        accel_input = 1.0f;     // accelerate
-    else if (car->speed > desired_speed + 0.5f)
-        accel_input = -1.0f;    // brake a bit
-
-    move_car(car, accel_input, turn_input, dt, start_x, start_y);
-}
-
-// Draw the HUD and track with player (1) and AI (2)
-void draw(const Car *player, const Car *ai) {
-    printf("\x1b[H"); // move cursor to top-left
-    printf("ASCII Off-Road (WASD to drive, Q to quit)\n");
-    printf("Player: lap %d/%d  speed %.1f   AI: lap %d/%d  speed %.1f\n",
-           player->laps, LAPS_TO_WIN, player->speed,
-           ai->laps, LAPS_TO_WIN, ai->speed);
+    printf("AI laps: ");
+    for (int i = 0; i < num_enemies; ++i) {
+        printf("%d/%d ", enemies[i].laps, MAX_LAPS);
+    }
     printf("\n");
 
-    char buf[MAP_H][MAP_W + 1];
-    for (int y = 0; y < MAP_H; ++y) {
-        memcpy(buf[y], TRACK[y], MAP_W + 1);
-    }
-
-    int px = (int)player->x;
-    int py = (int)player->y;
-    if (px >= 0 && px < MAP_W && py >= 0 && py < MAP_H) {
-        buf[py][px] = '1';
-    }
-
-    int ax = (int)ai->x;
-    int ay = (int)ai->y;
-    if (ax >= 0 && ax < MAP_W && ay >= 0 && ay < MAP_H) {
-        if (buf[ay][ax] == '1')
-            buf[ay][ax] = 'X'; // overlap
-        else
-            buf[ay][ax] = '2';
-    }
-
-    for (int y = 0; y < MAP_H; ++y) {
-        fwrite(buf[y], 1, MAP_W, stdout);
-        fputc('\n', stdout);
-    }
     fflush(stdout);
 }
 
-int main(void) {
-    // Find start/finish tile ('S')
-    int start_x = 0, start_y = 0;
-    for (int y = 0; y < MAP_H; ++y) {
-        for (int x = 0; x < MAP_W; ++x) {
-            if (TRACK[y][x] == 'S') {
-                start_x = x;
-                start_y = y;
-            }
-        }
+static void show_result(int winner, double total_time,
+                        const Player *p,
+                        const Enemy enemies[], int num_enemies) {
+    clear_screen();
+    move_cursor_home();
+
+    printf("Race finished!\n\n");
+    if (winner == 1) {
+        printf("You win!\n\n");
+    } else if (winner == 2) {
+        printf("You lost. An AI car won the race.\n\n");
+    } else {
+        printf("Race aborted.\n\n");
     }
 
-    Car player = {0};
-    Car ai = {0};
+    if (total_time < 0) total_time = 0;
+    int total_sec = (int)total_time;
+    int min = total_sec / 60;
+    int sec = total_sec % 60;
+    int ms  = (int)((total_time - (double)total_sec) * 1000.0);
 
-    // Player starts just to the right of 'S', facing left
-    player.x = start_x + 1.5f;
-    player.y = start_y + 0.5f;
-    player.prev_x = player.x;
-    player.prev_y = player.y;
-    player.speed = 0.0f;
-    player.angle = (float)M_PI;
-    player.laps = 0;
-    player.finished = 0;
+    printf("Total time: %02d:%02d.%03d\n", min, sec, ms);
+    printf("Your laps: %d / %d\n", p->laps, MAX_LAPS);
 
-    // AI starts at its first waypoint
-    ai.x = AI_WP[0][0];
-    ai.y = AI_WP[0][1];
-    ai.prev_x = ai.x;
-    ai.prev_y = ai.y;
-    ai.speed = 0.0f;
-    ai.angle = (float)M_PI;
-    ai.laps = 0;
-    ai.finished = 0;
+    for (int i = 0; i < num_enemies; ++i) {
+        printf("AI #%d laps: %d / %d\n",
+               i + 1, enemies[i].laps, MAX_LAPS);
+    }
 
-    int ai_wp_index = 0;
+    printf("\nPress ENTER to exit...\n");
+    fflush(stdout);
 
+    /* Now in canonical mode, wait for ENTER */
+    int ch;
+    do {
+        ch = getchar();
+        if (ch == EOF) break;
+    } while (ch != '\n');
+}
+
+int main(void) {
     enable_raw_mode();
 
-    double last_time = now_sec();
-    int running = 1;
-    int winner = 0; // 0 none, 1 player, 2 AI, 3 tie
+    build_track();
+    char map[HEIGHT][WIDTH];
+    init_map(map);
 
-    while (running) {
-        double now = now_sec();
-        float dt = (float)(now - last_time);
-        if (dt <= 0.0f) dt = DT;
-        if (dt > 0.1f) dt = 0.1f; // clamp if paused
-        last_time = now;
+    Player player;
+    Node start = track[0];
+    player.x = (float)start.x + 0.5f;
+    player.y = (float)start.y + 0.5f;
+    player.vx = player.vy = 0.0f;
+    player.angle = 0.0f;
+    player.laps = 0;
+    player.lap_state = LAP_STATE_BEFORE;
+    player.track_index = 0;
 
-        // Input for this frame
-        float accel_input = 0.0f;
-        float turn_input = 0.0f;
+    Enemy enemies[MAX_ENEMIES];
+    int num_enemies = 3;
+    if (num_enemies > MAX_ENEMIES) num_enemies = MAX_ENEMIES;
 
-        while (kbhit()) {
-            int ch = read_key();
-            if (ch == -1) break;
-            if (ch == 'q' || ch == 'Q') {
-                running = 0;
-            } else if (ch == 'w' || ch == 'W') {
-                accel_input = 1.0f;
-            } else if (ch == 's' || ch == 'S') {
-                accel_input = -1.0f;
-            } else if (ch == 'a' || ch == 'A') {
-                turn_input = -1.0f;
-            } else if (ch == 'd' || ch == 'D') {
-                turn_input = 1.0f;
-            }
-        }
-
-        if (!player.finished)
-            move_car(&player, accel_input, turn_input, dt, start_x, start_y);
-        if (!ai.finished)
-            update_ai(&ai, dt, start_x, start_y, &ai_wp_index);
-
-        draw(&player, &ai);
-
-        if (!winner) {
-            if (player.finished && ai.finished)
-                winner = 3;
-            else if (player.finished)
-                winner = 1;
-            else if (ai.finished)
-                winner = 2;
-
-            if (winner) {
-                running = 0;
-            }
-        }
-
-        // Frame limiting
-        double frame_time = now_sec() - now;
-        double target = 1.0 / FPS;
-        if (frame_time < target) {
-            int us = (int)((target - frame_time) * 1e6);
-            if (us > 0) usleep(us);
-        }
+    for (int i = 0; i < num_enemies; ++i) {
+        enemies[i].pos = (float)track_len * (float)(i + 1) / (float)(num_enemies + 1);
+        enemies[i].speed = 7.0f - 0.7f * (float)i; /* slightly different speeds */
+        enemies[i].laps = 0;
+        enemies[i].lap_state = LAP_STATE_BEFORE;
     }
 
+    clear_screen();
+    move_cursor_home();
+    printf("ASCII Super Sprint\n\n");
+    printf("Single-screen top-down racer.\n\n");
+    printf("Controls:\n");
+    printf("  W - Accelerate\n");
+    printf("  S - Brake / reverse\n");
+    printf("  A - Turn left\n");
+    printf("  D - Turn right\n");
+    printf("  Q - Quit\n\n");
+    printf("First to %d laps wins.\n\n", MAX_LAPS);
+    printf("Press any key to start...\n");
+    fflush(stdout);
+
+    while (read_key_nonblock() == -1) {
+        usleep(10000);
+    }
+
+    double start_time = current_time_sec();
+    double total_time = 0.0;
+    int running = 1;
+    int winner  = 0;
+    const float dt = (float)TICK_USEC / 1000000.0f;
+
+    while (running) {
+        int accel = 0, brake = 0, left = 0, right = 0;
+
+        int ch;
+        /* Process all pending key presses this frame */
+        while ((ch = read_key_nonblock()) != -1) {
+            if (ch == 'q' || ch == 'Q') {
+                running = 0;
+                winner = 0;
+                break;
+            } else if (ch == 'w' || ch == 'W') {
+                accel = 1;
+            } else if (ch == 's' || ch == 'S') {
+                brake = 1;
+            } else if (ch == 'a' || ch == 'A') {
+                left = 1;
+            } else if (ch == 'd' || ch == 'D') {
+                right = 1;
+            }
+        }
+        if (!running)
+            break;
+
+        update_player(&player, map, dt, accel, brake, left, right);
+        update_player_lap(&player);
+        update_enemies(enemies, num_enemies, dt);
+
+        if (player.laps >= MAX_LAPS) {
+            winner = 1;
+            running = 0;
+        } else {
+            for (int i = 0; i < num_enemies; ++i) {
+                if (enemies[i].laps >= MAX_LAPS) {
+                    if (winner == 0) {
+                        winner = 2;
+                    }
+                    running = 0;
+                    break;
+                }
+            }
+        }
+
+        render(map, &player, enemies, num_enemies, start_time);
+
+        usleep(TICK_USEC);
+    }
+
+    total_time = current_time_sec() - start_time;
+
     disable_raw_mode();
-    printf("\n");
-    if (winner == 1)
-        printf("You win! (%d laps)\n", LAPS_TO_WIN);
-    else if (winner == 2)
-        printf("AI wins. Try again! (%d laps)\n", LAPS_TO_WIN);
-    else if (winner == 3)
-        printf("It's a tie! (%d laps)\n", LAPS_TO_WIN);
-    else
-        printf("Race ended.\n");
+    show_result(winner, total_time, &player, enemies, num_enemies);
 
     return 0;
 }
