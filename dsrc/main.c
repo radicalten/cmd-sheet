@@ -1,355 +1,467 @@
+/*
+ * Simple terminal figure-8 racing game
+ *
+ * - Single screen, top-down, ASCII-art, sideways figure-8 (∞) track
+ * - Single-player time trial: 3 laps
+ * - Lap counter, timer, best lap, victory screen
+ * - Controls: WASD or arrow keys; q / ESC to quit
+ *
+ * Compile (POSIX terminal, e.g. Linux/macOS):
+ *   cc -std=c99 -Wall -O2 race.c -o race -lm
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <time.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/time.h>
 #include <math.h>
+#include <string.h>
+#include <stdbool.h>
 
-#ifdef _WIN32
-    #include <windows.h>
-    #include <conio.h>
-    #define CLEAR "cls"
-#else
-    #include <unistd.h>
-    #include <termios.h>
-    #include <fcntl.h>
-    #define CLEAR "clear"
-#endif
+#define WIDTH       50
+#define HEIGHT      20
+#define FRAME_TIME  (1.0/60.0)
+#define TOTAL_LAPS  3
+#define HUGE_TIME   1e9
+#define PI          3.14159265358979323846
 
-// Game constants
-#define SCREEN_WIDTH 70
-#define SCREEN_HEIGHT 25
-#define TARGET_LAPS 3
+/* Track grid: 1 = road, 0 = off-track */
+static int track[HEIGHT][WIDTH];
 
-// Player structure
-typedef struct {
-    float x, y;
-    float dx, dy;
-    float angle;
-    int laps;
-    int crossed_middle;
-    int crossed_finish;
-} Player;
+/* Track geometry info */
+static int centerY;
+static int leftCenterX, rightCenterX;
+static int outerR, innerR;
+static double trackLength;
 
-// Game state
-typedef struct {
-    char track[SCREEN_HEIGHT][SCREEN_WIDTH];
-    Player player;
-    clock_t start_time;
-    int game_over;
-    float final_time;
-} GameState;
+/* Car state */
+static double carX, carY;
+static double carAngle;   /* radians, 0 = right, pi/2 = up */
+static double carSpeed;
 
-#ifndef _WIN32
-struct termios orig_termios;
+/* Race state */
+static int    raceStarted = 0;
+static int    raceFinished = 0;
+static int    lapsCompleted = 0;
+static double raceStartTime = 0.0;
+static double totalRaceTime = 0.0;
+static double bestLapTime = HUGE_TIME;
+static double lapStartTime = 0.0;
+static double distThisLap = 0.0;
 
-void disable_raw_mode() {
-    tcsetattr(0, TCSAFLUSH, &orig_termios);
+/* Input state (per frame) */
+static int keyAccel = 0;
+static int keyBrake = 0;
+static int keyLeft  = 0;
+static int keyRight = 0;
+static int keyQuit  = 0;
+
+/* Terminal state */
+static struct termios origTermios;
+static int rawModeEnabled = 0;
+
+/* Time in seconds (double) */
+static double getTimeSeconds(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + tv.tv_usec / 1000000.0;
 }
 
-void enable_raw_mode() {
-    tcgetattr(0, &orig_termios);
-    atexit(disable_raw_mode);
-    struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
-    tcsetattr(0, TCSAFLUSH, &raw);
-}
-
-int kbhit() {
-    struct timeval tv = {0, 0};
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(0, &fds);
-    return select(1, &fds, NULL, NULL, &tv) > 0;
-}
-
-int getch() {
-    int c = getchar();
-    return c;
-}
-
-void msleep(int ms) {
-    usleep(ms * 1000);
-}
-#else
-void enable_raw_mode() {}
-void disable_raw_mode() {}
-void msleep(int ms) {
-    Sleep(ms);
-}
-#endif
-
-void clear_screen() {
-    printf("\033[2J\033[H");
+/* Restore terminal */
+static void disableRawMode(void) {
+    if (rawModeEnabled) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &origTermios);
+        rawModeEnabled = 0;
+    }
+    /* Show cursor */
+    printf("\x1b[?25h");
     fflush(stdout);
 }
 
-void draw_circle(char track[SCREEN_HEIGHT][SCREEN_WIDTH], int cx, int cy, int rx, int ry, char fill) {
-    for (int angle = 0; angle < 360; angle += 1) {
-        float rad = angle * 3.14159265f / 180.0f;
-        int x = cx + (int)(rx * cos(rad));
-        int y = cy + (int)(ry * sin(rad));
-        if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT) {
-            track[y][x] = fill;
-        }
+/* Put terminal in raw mode */
+static void enableRawMode(void) {
+    if (tcgetattr(STDIN_FILENO, &origTermios) == -1) {
+        perror("tcgetattr");
+        exit(1);
     }
+    atexit(disableRawMode);
+
+    struct termios raw = origTermios;
+    raw.c_lflag &= ~(ECHO | ICANON);      /* no echo, noncanonical */
+    raw.c_iflag &= ~(IXON | ICRNL);       /* no Ctrl-S/Q, no CR->NL */
+    raw.c_oflag &= ~(OPOST);              /* no post-processing */
+    raw.c_cc[VMIN]  = 0;                  /* non-blocking read */
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
+        perror("tcsetattr");
+        exit(1);
+    }
+    rawModeEnabled = 1;
+
+    /* Clear screen, home cursor, hide cursor */
+    printf("\x1b[2J\x1b[H\x1b[?25l");
+    fflush(stdout);
 }
 
-void init_track(GameState* game) {
-    // Fill with grass
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            game->track[y][x] = '.';
-        }
+/* Format time as MM:SS.mmm */
+static void formatTime(double t, char *buf, size_t len) {
+    if (t < 0.0) t = 0.0;
+    int minutes = (int)(t / 60.0);
+    double rem  = t - minutes * 60.0;
+    int seconds = (int)rem;
+    int millis  = (int)((rem - seconds) * 1000.0 + 0.5);
+
+    if (millis >= 1000) {
+        millis -= 1000;
+        seconds++;
     }
-    
-    // Draw figure-8 track (two circles connected)
-    // Top loop - outer
-    draw_circle(game->track, 35, 8, 16, 6, '#');
-    // Top loop - inner
-    draw_circle(game->track, 35, 8, 12, 4, ' ');
-    
-    // Bottom loop - outer
-    draw_circle(game->track, 35, 17, 16, 6, '#');
-    // Bottom loop - inner  
-    draw_circle(game->track, 35, 17, 12, 4, ' ');
-    
-    // Draw finish line at top
-    for (int i = -3; i <= 3; i++) {
-        if (35+i >= 0 && 35+i < SCREEN_WIDTH && 2 >= 0 && 2 < SCREEN_HEIGHT) {
-            game->track[2][35+i] = '=';
-        }
+    if (seconds >= 60) {
+        seconds -= 60;
+        minutes++;
     }
+    snprintf(buf, len, "%02d:%02d.%03d", minutes, seconds, millis);
 }
 
-void init_game(GameState* game) {
-    init_track(game);
-    
-    game->player.x = 35.0f;
-    game->player.y = 4.0f;
-    game->player.angle = 3.14159f / 2;  // Pointing down
-    game->player.dx = 0;
-    game->player.dy = 0;
-    game->player.laps = 0;
-    game->player.crossed_middle = 0;
-    game->player.crossed_finish = 0;
-    game->start_time = clock();
-    game->game_over = 0;
-    game->final_time = 0;
-}
+/* Initialize figure-8 track and car position */
+static void initTrack(void) {
+    memset(track, 0, sizeof(track));
 
-int is_on_track(GameState* game, int x, int y) {
-    if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT) {
-        return 0;
-    }
-    
-    char c = game->track[y][x];
-    return (c == ' ' || c == '=');
-}
+    centerY     = HEIGHT / 2;
+    leftCenterX = WIDTH / 3;
+    rightCenterX = (WIDTH * 2) / 3;
 
-void update_player(GameState* game, char input) {
-    float accel = 0.15f;
-    float turn_speed = 0.12f;
-    float friction = 0.98f;
-    float max_speed = 1.5f;
-    
-    // Handle input
-    if (input == 'w' || input == 'W') {
-        game->player.dx += cos(game->player.angle) * accel;
-        game->player.dy += sin(game->player.angle) * accel;
-    }
-    if (input == 's' || input == 'S') {
-        game->player.dx -= cos(game->player.angle) * accel * 0.5f;
-        game->player.dy -= sin(game->player.angle) * accel * 0.5f;
-    }
-    if (input == 'a' || input == 'A') {
-        game->player.angle -= turn_speed;
-    }
-    if (input == 'd' || input == 'D') {
-        game->player.angle += turn_speed;
-    }
-    
-    // Apply friction
-    game->player.dx *= friction;
-    game->player.dy *= friction;
-    
-    // Limit speed
-    float speed = sqrt(game->player.dx * game->player.dx + game->player.dy * game->player.dy);
-    if (speed > max_speed) {
-        game->player.dx = (game->player.dx / speed) * max_speed;
-        game->player.dy = (game->player.dy / speed) * max_speed;
-    }
-    
-    // Update position
-    float new_x = game->player.x + game->player.dx;
-    float new_y = game->player.y + game->player.dy;
-    
-    // Check collision
-    if (is_on_track(game, (int)new_x, (int)new_y)) {
-        game->player.x = new_x;
-        game->player.y = new_y;
-    } else {
-        // Collision - bounce back
-        game->player.dx *= -0.3f;
-        game->player.dy *= -0.3f;
-    }
-    
-    // Lap detection
-    int py = (int)game->player.y;
-    int px = (int)game->player.x;
-    
-    // Check if crossed middle of track (around y=12-13)
-    if (py >= 11 && py <= 14 && px >= 30 && px <= 40) {
-        if (!game->player.crossed_middle) {
-            game->player.crossed_middle = 1;
-        }
-    }
-    
-    // Check if crossed finish line
-    if (py >= 2 && py <= 5 && px >= 32 && px <= 38) {
-        if (game->player.crossed_middle && !game->player.crossed_finish) {
-            game->player.crossed_finish = 1;
-            game->player.laps++;
-            game->player.crossed_middle = 0;
-            
-            if (game->player.laps >= TARGET_LAPS) {
-                game->game_over = 1;
-                game->final_time = (float)(clock() - game->start_time) / CLOCKS_PER_SEC;
+    outerR = HEIGHT / 3;
+    if (outerR < 4) outerR = 4;
+    innerR = outerR - 3;
+    if (innerR < 1) innerR = 1;
+
+    int outer2 = outerR * outerR;
+    int inner2 = innerR * innerR;
+
+    for (int y = 0; y < HEIGHT; y++) {
+        int dy = y - centerY;
+        for (int x = 0; x < WIDTH; x++) {
+            int dx1 = x - leftCenterX;
+            int dx2 = x - rightCenterX;
+            int d1 = dx1 * dx1 + dy * dy;
+            int d2 = dx2 * dx2 + dy * dy;
+
+            int ring1 = (d1 >= inner2 && d1 <= outer2);
+            int ring2 = (d2 >= inner2 && d2 <= outer2);
+            if (ring1 || ring2) {
+                track[y][x] = 1;
             }
         }
-    } else {
-        game->player.crossed_finish = 0;
     }
-}
 
-void render(GameState* game) {
-    clear_screen();
-    
-    // Create display buffer
-    char display[SCREEN_HEIGHT][SCREEN_WIDTH];
-    memcpy(display, game->track, sizeof(display));
-    
-    // Draw player
-    int px = (int)game->player.x;
-    int py = (int)game->player.y;
-    if (px >= 0 && px < SCREEN_WIDTH && py >= 0 && py < SCREEN_HEIGHT) {
-        display[py][px] = 'X';
-    }
-    
-    // Render display
-    printf("╔");
-    for (int i = 0; i < SCREEN_WIDTH; i++) printf("═");
-    printf("╗\n");
-    
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        printf("║");
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            char c = display[y][x];
-            if (c == '#') {
-                printf("█");
-            } else if (c == '=') {
-                printf("▓");
-            } else if (c == 'X') {
-                printf("▲");
-            } else if (c == ' ') {
-                printf(" ");
-            } else {
-                printf("░");
-            }
-        }
-        printf("║\n");
-    }
-    
-    printf("╚");
-    for (int i = 0; i < SCREEN_WIDTH; i++) printf("═");
-    printf("╝\n");
-    
-    // Draw HUD
-    float elapsed = (float)(clock() - game->start_time) / CLOCKS_PER_SEC;
-    float speed = sqrt(game->player.dx * game->player.dx + game->player.dy * game->player.dy);
-    
-    printf("\n  LAP: %d/%d  |  TIME: %.2f s  |  SPEED: %.1f\n", 
-           game->player.laps, TARGET_LAPS, elapsed, speed * 20);
-    printf("  Controls: [W] Accelerate  [S] Brake  [A] Left  [D] Right  [Q] Quit\n");
-}
-
-void show_victory(GameState* game) {
-    clear_screen();
-    printf("\n\n\n");
-    printf("         ╔═══════════════════════════════════════════╗\n");
-    printf("         ║                                           ║\n");
-    printf("         ║            🏁 RACE COMPLETE! 🏁           ║\n");
-    printf("         ║                                           ║\n");
-    printf("         ║         You finished %d laps!             ║\n", TARGET_LAPS);
-    printf("         ║                                           ║\n");
-    printf("         ║       Final Time: %.2f seconds           ║\n", game->final_time);
-    printf("         ║                                           ║\n");
-    printf("         ║         🏆 CONGRATULATIONS! 🏆            ║\n");
-    printf("         ║                                           ║\n");
-    printf("         ╚═══════════════════════════════════════════╝\n");
-    printf("\n\n         Press any key to exit...\n");
-    
-    #ifdef _WIN32
-    _getch();
-    #else
-    getchar();
-    #endif
-}
-
-int main() {
-    GameState game;
-    
-    enable_raw_mode();
-    
-    clear_screen();
-    printf("\n\n");
-    printf("         ╔═══════════════════════════════════════════╗\n");
-    printf("         ║                                           ║\n");
-    printf("         ║          TOP-DOWN RACING GAME             ║\n");
-    printf("         ║                                           ║\n");
-    printf("         ║      Complete %d laps as fast as you can! ║\n", TARGET_LAPS);
-    printf("         ║                                           ║\n");
-    printf("         ║         Press any key to start...         ║\n");
-    printf("         ║                                           ║\n");
-    printf("         ╚═══════════════════════════════════════════╝\n");
-    
-    #ifdef _WIN32
-    _getch();
-    #else
-    getchar();
-    #endif
-    
-    init_game(&game);
-    
-    // Game loop
-    while (!game.game_over) {
-        char input = 0;
-        
-        // Get input
-        if (kbhit()) {
-            input = getch();
-            if (input == 'q' || input == 'Q' || input == 27) {  // 27 = ESC
+    /* Place car near lower part of left loop */
+    int startX = -1, startY = -1;
+    for (int y = centerY; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            if (track[y][x]) {
+                startX = x;
+                startY = y;
                 break;
             }
         }
-        
-        // Update
-        update_player(&game, input);
-        
-        // Render
-        render(&game);
-        
-        // Frame delay (targeting ~30 FPS)
-        msleep(33);
+        if (startX != -1) break;
     }
-    
-    if (game.game_over) {
-        show_victory(&game);
+
+    if (startX == -1) {
+        /* Fallback: any road cell */
+        for (int y = 0; y < HEIGHT; y++) {
+            for (int x = 0; x < WIDTH; x++) {
+                if (track[y][x]) {
+                    startX = x;
+                    startY = y;
+                    break;
+                }
+            }
+            if (startX != -1) break;
+        }
     }
-    
-    disable_raw_mode();
-    clear_screen();
-    
+
+    if (startX == -1) {
+        fprintf(stderr, "Track generation failed.\n");
+        exit(1);
+    }
+
+    carX = startX + 0.5;
+    carY = startY + 0.5;
+    carAngle = 0.0;    /* facing right */
+    carSpeed = 0.0;
+
+    /* Approximate lap length: 2 loops of mean radius */
+    double meanRadius = 0.5 * (outerR + innerR);
+    trackLength = 4.0 * PI * meanRadius;
+}
+
+/* Read keyboard input, set key flags for this frame */
+static void processInput(void) {
+    keyAccel = keyBrake = keyLeft = keyRight = keyQuit = 0;
+
+    char buf[32];
+    int n;
+    while ((n = (int)read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)buf[i];
+
+            if (c == 27) {  /* ESC or escape sequence */
+                if (i + 2 < n && buf[i + 1] == '[') {
+                    char d = buf[i + 2];
+                    if (d == 'A') keyAccel = 1;   /* Up */
+                    else if (d == 'B') keyBrake = 1; /* Down */
+                    else if (d == 'C') keyRight = 1; /* Right */
+                    else if (d == 'D') keyLeft  = 1; /* Left */
+                    i += 2;
+                } else {
+                    keyQuit = 1;
+                }
+            } else {
+                if (c == 'q' || c == 'Q') keyQuit  = 1;
+                else if (c == 'w' || c == 'W') keyAccel = 1;
+                else if (c == 's' || c == 'S') keyBrake = 1;
+                else if (c == 'a' || c == 'A') keyLeft  = 1;
+                else if (c == 'd' || c == 'D') keyRight = 1;
+            }
+        }
+    }
+}
+
+/* Update car physics; return distance moved this frame along track */
+static double updateCar(double dt) {
+    const double ACCEL     = 25.0;
+    const double BRAKE     = 30.0;
+    const double MAX_SPEED = 20.0;
+    const double FRICTION  = 5.0;
+    const double TURN_RATE = 2.8;  /* radians/sec at full speed */
+
+    /* Acceleration / braking */
+    if (keyAccel) {
+        carSpeed += ACCEL * dt;
+    }
+    if (keyBrake) {
+        carSpeed -= BRAKE * dt;
+    }
+
+    /* Natural friction when not using throttle */
+    if (!keyAccel && !keyBrake) {
+        if (carSpeed > 0.0) {
+            carSpeed -= FRICTION * dt;
+            if (carSpeed < 0.0) carSpeed = 0.0;
+        } else if (carSpeed < 0.0) {
+            carSpeed += FRICTION * dt;
+            if (carSpeed > 0.0) carSpeed = 0.0;
+        }
+    }
+
+    /* Clamp speed */
+    if (carSpeed >  MAX_SPEED)        carSpeed =  MAX_SPEED;
+    if (carSpeed < -MAX_SPEED * 0.5)  carSpeed = -MAX_SPEED * 0.5; /* limited reverse */
+
+    /* Steering */
+    double speedFactor = fabs(carSpeed) / MAX_SPEED;
+    if (speedFactor > 1.0) speedFactor = 1.0;
+    if (speedFactor < 0.1) speedFactor = 0.1; /* allow some steering when slow */
+
+    if (keyLeft)  carAngle -= TURN_RATE * speedFactor * dt;
+    if (keyRight) carAngle += TURN_RATE * speedFactor * dt;
+
+    /* Normalize angle */
+    if (carAngle > PI)      carAngle -= 2.0 * PI;
+    else if (carAngle < -PI) carAngle += 2.0 * PI;
+
+    double prevX = carX;
+    double prevY = carY;
+
+    double nx = carX + cos(carAngle) * carSpeed * dt;
+    double ny = carY - sin(carAngle) * carSpeed * dt; /* screen y goes down */
+
+    double distMoved = 0.0;
+
+    int gx = (int)floor(nx + 0.5);
+    int gy = (int)floor(ny + 0.5);
+
+    if (gx >= 0 && gx < WIDTH && gy >= 0 && gy < HEIGHT && track[gy][gx]) {
+        /* Still on road */
+        carX = nx;
+        carY = ny;
+        double dx = carX - prevX;
+        double dy = carY - prevY;
+        distMoved = sqrt(dx * dx + dy * dy);
+    } else {
+        /* Off-track penalty: big slowdown, stay in place */
+        carSpeed *= 0.2;
+    }
+
+    return distMoved;
+}
+
+/* Render HUD and track */
+static void render(double now) {
+    char timeBuf[32];
+    char bestBuf[32];
+
+    if (raceStarted) {
+        formatTime(now - raceStartTime, timeBuf, sizeof(timeBuf));
+    } else {
+        snprintf(timeBuf, sizeof(timeBuf), "00:00.000");
+    }
+
+    if (bestLapTime < HUGE_TIME * 0.5) {
+        formatTime(bestLapTime, bestBuf, sizeof(bestBuf));
+    } else {
+        snprintf(bestBuf, sizeof(bestBuf), "--:--.---");
+    }
+
+    int displayLap;
+    if (raceFinished) {
+        displayLap = TOTAL_LAPS;
+    } else if (raceStarted) {
+        displayLap = lapsCompleted + 1;
+        if (displayLap > TOTAL_LAPS) displayLap = TOTAL_LAPS;
+    } else {
+        displayLap = 0;
+    }
+
+    /* Move cursor to top-left */
+    printf("\x1b[H");
+    printf("Lap: %d/%d   Time: %s   Best lap: %s\n",
+           displayLap, TOTAL_LAPS, timeBuf, bestBuf);
+    printf("Controls: arrows or WASD to drive, 'q' to quit. "
+           "Track: sideways figure-8\n");
+
+    int cx = (int)floor(carX + 0.5);
+    int cy = (int)floor(carY + 0.5);
+
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            char ch = ' ';
+            if (track[y][x]) {
+                int edge = 0;
+                /* Check 4-neighbor edge to draw borders */
+                int nx, ny;
+                ny = y - 1; nx = x;
+                if (ny < 0 || !track[ny][nx]) edge = 1;
+                ny = y + 1; nx = x;
+                if (!edge && (ny >= HEIGHT || !track[ny][nx])) edge = 1;
+                ny = y; nx = x - 1;
+                if (!edge && (nx < 0 || !track[ny][nx])) edge = 1;
+                ny = y; nx = x + 1;
+                if (!edge && (nx >= WIDTH || !track[ny][nx])) edge = 1;
+
+                ch = edge ? '#' : '.';
+            }
+            if (x == cx && y == cy) {
+                ch = '@';  /* car */
+            }
+            putchar(ch);
+        }
+        putchar('\n');
+    }
+    fflush(stdout);
+}
+
+/* Victory screen after race completion */
+static void showVictoryScreen(void) {
+    char totalBuf[32];
+    char bestBuf[32];
+
+    formatTime(totalRaceTime, totalBuf, sizeof(totalBuf));
+    if (bestLapTime < HUGE_TIME * 0.5) {
+        formatTime(bestLapTime, bestBuf, sizeof(bestBuf));
+    } else {
+        snprintf(bestBuf, sizeof(bestBuf), "--:--.---");
+    }
+
+    printf("\x1b[2J\x1b[H");
+    printf("===== RACE COMPLETE =====\n\n");
+    printf("Laps:       %d\n", TOTAL_LAPS);
+    printf("Total time: %s\n", totalBuf);
+    printf("Best lap:   %s\n", bestBuf);
+    printf("\nPress 'q' or ESC to quit.\n");
+    fflush(stdout);
+
+    while (1) {
+        char buf[16];
+        int n = (int)read(STDIN_FILENO, buf, sizeof(buf));
+        if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                unsigned char c = (unsigned char)buf[i];
+                if (c == 'q' || c == 'Q' || c == 27 || c == '\n' || c == '\r') {
+                    return;
+                }
+            }
+        } else {
+            usleep(10000);
+        }
+    }
+}
+
+int main(void) {
+    enableRawMode();
+    initTrack();
+
+    double lastTime = getTimeSeconds();
+
+    while (1) {
+        double now = getTimeSeconds();
+        double dt = now - lastTime;
+        if (dt < 0.0) dt = 0.0;
+        if (dt > 0.1) dt = 0.1;  /* clamp big jumps */
+
+        processInput();
+        if (keyQuit) {
+            break;
+        }
+
+        double distMoved = updateCar(dt);
+
+        /* Start race when player actually moves */
+        if (!raceStarted) {
+            if (fabs(carSpeed) > 0.5 && distMoved > 0.0) {
+                raceStarted = 1;
+                raceStartTime = now;
+                lapStartTime  = now;
+                distThisLap   = 0.0;
+                lapsCompleted = 0;
+            }
+        } else if (!raceFinished) {
+            distThisLap += distMoved;
+            if (distThisLap >= trackLength) {
+                lapsCompleted++;
+                double lapTime = now - lapStartTime;
+                lapStartTime = now;
+                distThisLap -= trackLength;
+                if (lapTime < bestLapTime) bestLapTime = lapTime;
+                if (lapsCompleted >= TOTAL_LAPS) {
+                    raceFinished = 1;
+                    totalRaceTime = now - raceStartTime;
+                }
+            }
+        }
+
+        render(now);
+
+        if (raceFinished) {
+            break;
+        }
+
+        double frameEnd = getTimeSeconds();
+        double frameElapsed = frameEnd - now;
+        double sleepTime = FRAME_TIME - frameElapsed;
+        if (sleepTime > 0.0) {
+            usleep((useconds_t)(sleepTime * 1000000.0));
+        }
+
+        lastTime = now;
+    }
+
+    if (raceFinished) {
+        showVictoryScreen();
+    }
+
     return 0;
 }
