@@ -1,281 +1,350 @@
-// figure8_racer.c
-// Simple single-screen top-down racing game (sideways figure-8 track)
-// Controls: A/D to steer, Q to quit
-// Build on POSIX systems:  gcc -std=c99 -O2 figure8_racer.c -lm -o racer
+/*
+ * SUPER OFF-ROAD TRIBUTE - Single File C Program
+ * Platform: Windows (Win32 API)
+ *
+ * Controls:
+ *   ARROW KEYS: Steer and Accelerate
+ *   SPACE:      Nitro
+ *   ESC:        Exit
+ */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <termios.h>
-#include <fcntl.h>
+#include <windows.h>
 #include <math.h>
-#include <string.h>
+#include <stdio.h>
 
-#define SCREEN_W 80
-#define SCREEN_H 24
+#define SCREEN_W 800
+#define SCREEN_H 600
+#define PI 3.14159265f
+#define DEG2RAD(x) ((x) * (PI / 180.0f))
 
-#define TRACK_W  60
-#define TRACK_H  20
+// --- Physics Constants ---
+#define ACCEL 0.25f
+#define TURN_SPEED 4.5f
+#define DRAG 0.97f          // Friction (loose dirt feel)
+#define OFFROAD_DRAG 0.90f  // Friction when hitting walls/grass
+#define MAX_SPEED 12.0f
+#define NITRO_FORCE 0.6f
+#define CAR_WIDTH 14
+#define CAR_LENGTH 24
 
-#define TRACK_OFFSET_X ((SCREEN_W - TRACK_W) / 2)
-#define TRACK_OFFSET_Y 1
+// --- Game State ---
+typedef struct {
+    float x, y;
+    float vx, vy;
+    float angle; // Degrees
+    int nitro_fuel;
+    COLORREF color;
+} Car;
 
-static struct termios orig_termios;
-static int orig_fl;
+Car player;
+int game_running = 1;
+int width, height;
 
-static char track[TRACK_H][TRACK_W];
-static unsigned char isRoad[TRACK_H][TRACK_W];
+// Track boundaries (Two islands for Figure-8)
+// Island 1 (Left)
+RECT island1 = { 150, 150, 350, 450 };
+// Island 2 (Right)
+RECT island2 = { 450, 150, 650, 450 };
 
-void disable_raw_mode(void) {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-    fcntl(STDIN_FILENO, F_SETFL, orig_fl);
-    /* show cursor */
-    write(STDOUT_FILENO, "\x1b[?25h", 6);
-}
+// --- Function Prototypes ---
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+void InitGame();
+void UpdatePhysics();
+void DrawGame(HDC hdc, RECT* rect);
+void DrawRotatedRect(HDC hdc, float x, float y, float w, float h, float angle, COLORREF color);
 
-void enable_raw_mode(void) {
-    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) {
-        perror("tcgetattr");
-        exit(1);
-    }
-    orig_fl = fcntl(STDIN_FILENO, F_GETFL);
-    if (orig_fl == -1) {
-        perror("fcntl");
-        exit(1);
-    }
+// --- Entry Point ---
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    const char CLASS_NAME[] = "OffRoadClass";
 
-    atexit(disable_raw_mode);
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
 
-    struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON | ISIG);
-    raw.c_iflag &= ~(IXON | ICRNL);
-    raw.c_oflag &= ~(OPOST);
-    raw.c_cc[VMIN]  = 0;
-    raw.c_cc[VTIME] = 0;
+    RegisterClass(&wc);
 
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
-        perror("tcsetattr");
-        exit(1);
-    }
+    // Adjust window size to ensure client area is SCREEN_W x SCREEN_H
+    RECT winRect = { 0, 0, SCREEN_W, SCREEN_H };
+    AdjustWindowRect(&winRect, WS_OVERLAPPEDWINDOW, FALSE);
 
-    if (fcntl(STDIN_FILENO, F_SETFL, orig_fl | O_NONBLOCK) == -1) {
-        perror("fcntl");
-        exit(1);
-    }
+    HWND hwnd = CreateWindowEx(
+        0, CLASS_NAME, "Single File Super Off-Road Tribute",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        winRect.right - winRect.left, winRect.bottom - winRect.top,
+        NULL, NULL, hInstance, NULL
+    );
 
-    /* hide cursor and clear screen */
-    write(STDOUT_FILENO, "\x1b[?25l\x1b[2J", 10);
-}
+    if (hwnd == NULL) return 0;
 
-void init_track(void) {
-    int x, y;
-    for (y = 0; y < TRACK_H; ++y) {
-        for (x = 0; x < TRACK_W; ++x) {
-            track[y][x] = ' ';
-            isRoad[y][x] = 0;
+    InitGame();
+
+    // Main Game Loop
+    MSG msg = {0};
+    HDC hdc;
+    LARGE_INTEGER frequency, start, end;
+    double interval;
+    
+    QueryPerformanceFrequency(&frequency);
+    interval = 1000.0 / 60.0; // 60 FPS target
+
+    while (game_running) {
+        // Handle Windows messages
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) game_running = 0;
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        QueryPerformanceCounter(&start);
+
+        // Game Logic
+        UpdatePhysics();
+
+        // Render
+        hdc = GetDC(hwnd);
+        GetClientRect(hwnd, &winRect);
+        DrawGame(hdc, &winRect);
+        ReleaseDC(hwnd, hdc);
+
+        // Frame Limiter
+        QueryPerformanceCounter(&end);
+        double elapsed = (double)(end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart;
+        if (elapsed < interval) {
+            Sleep((DWORD)(interval - elapsed));
         }
     }
 
-    /* Parameters for sideways figure-8 (infinity symbol) */
-    double R = (TRACK_H - 4) / 2.0;      /* loop radius */
-    double d = R * 1.5;                  /* distance between loop centers (< 2R) */
-    double thickness = 1.2;              /* road half-width */
-
-    double total = 2.0 * R + d;
-    double margin = (TRACK_W - total) / 2.0;
-    double cx1 = margin + R;
-    double cx2 = cx1 + d;
-    double cy  = TRACK_H / 2.0;
-
-    for (y = 0; y < TRACK_H; ++y) {
-        for (x = 0; x < TRACK_W; ++x) {
-            double dx1 = x - cx1;
-            double dy1 = y - cy;
-            double dx2 = x - cx2;
-            double dy2 = y - cy;
-            double dist1 = sqrt(dx1 * dx1 + dy1 * dy1);
-            double dist2 = sqrt(dx2 * dx2 + dy2 * dy2);
-
-            if (fabs(dist1 - R) <= thickness || fabs(dist2 - R) <= thickness) {
-                track[y][x] = '#';
-                isRoad[y][x] = 1;
-            }
-        }
-    }
-
-    /* Strengthen the central crossover (horizontal band) */
-    int x_start = (int)cx1;
-    int x_end   = (int)cx2;
-    int y_center = (int)cy;
-    for (y = y_center - 1; y <= y_center + 1; ++y) {
-        if (y < 0 || y >= TRACK_H) continue;
-        for (x = x_start; x <= x_end; ++x) {
-            if (x < 0 || x >= TRACK_W) continue;
-            track[y][x] = '#';
-            isRoad[y][x] = 1;
-        }
-    }
-}
-
-int on_track(double x, double y) {
-    int ix = (int)floor(x);
-    int iy = (int)floor(y);
-    if (ix < 0 || ix >= TRACK_W || iy < 0 || iy >= TRACK_H)
-        return 0;
-    return isRoad[iy][ix];
-}
-
-void handle_input(double *turn, int *quit) {
-    char buf[32];
-    ssize_t n;
-    *turn = 0.0;
-
-    while ((n = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
-        for (ssize_t i = 0; i < n; ++i) {
-            char c = buf[i];
-            if (c == 'q' || c == 'Q') {
-                *quit = 1;
-            } else if (c == 'a' || c == 'A') {
-                *turn -= 1.0;
-            } else if (c == 'd' || c == 'D') {
-                *turn += 1.0;
-            }
-        }
-    }
-    /* Ignore EAGAIN / EWOULDBLOCK */
-}
-
-void render(double carX, double carY, double elapsed, int crashed) {
-    char screen[SCREEN_H][SCREEN_W + 1];
-    int x, y;
-
-    for (y = 0; y < SCREEN_H; ++y) {
-        for (x = 0; x < SCREEN_W; ++x) {
-            screen[y][x] = ' ';
-        }
-        screen[y][SCREEN_W] = '\0';
-    }
-
-    /* Copy track */
-    for (y = 0; y < TRACK_H; ++y) {
-        for (x = 0; x < TRACK_W; ++x) {
-            int sx = TRACK_OFFSET_X + x;
-            int sy = TRACK_OFFSET_Y + y;
-            if (sx >= 0 && sx < SCREEN_W && sy >= 0 && sy < SCREEN_H - 1) {
-                screen[sy][sx] = track[y][x];
-            }
-        }
-    }
-
-    /* Place car */
-    int carCellX = (int)floor(carX + 0.5);
-    int carCellY = (int)floor(carY + 0.5);
-    int sx = TRACK_OFFSET_X + carCellX;
-    int sy = TRACK_OFFSET_Y + carCellY;
-    if (sx >= 0 && sx < SCREEN_W && sy >= 0 && sy < SCREEN_H - 1) {
-        screen[sy][sx] = '@';
-    }
-
-    /* Draw */
-    write(STDOUT_FILENO, "\x1b[H", 3); /* move cursor to home */
-    for (y = 0; y < SCREEN_H - 1; ++y) {
-        for (x = 0; x < SCREEN_W; ++x) {
-            char c = screen[y][x];
-            if (c == '@') {
-                /* red car */
-                write(STDOUT_FILENO, "\x1b[31m@\x1b[0m", 10);
-            } else {
-                write(STDOUT_FILENO, &c, 1);
-            }
-        }
-        write(STDOUT_FILENO, "\n", 1);
-    }
-
-    char hud[128];
-    if (!crashed) {
-        snprintf(hud, sizeof(hud),
-                 "A/D: steer   Q: quit   Time: %.1f s",
-                 elapsed);
-    } else {
-        snprintf(hud, sizeof(hud),
-                 "CRASHED after %.1f s. Press Q to quit.", elapsed);
-    }
-    write(STDOUT_FILENO, hud, strlen(hud));
-    write(STDOUT_FILENO, "\x1b[K", 3); /* clear to end of line */
-}
-
-int main(void) {
-    enable_raw_mode();
-    init_track();
-
-    const double DT = 0.05;        /* 20 FPS */
-    const double SPEED = 7.0;      /* cells per second */
-    const double TURN_RATE = 2.5;  /* radians/sec per unit of input */
-
-    /* Starting position: left side of left loop, heading right */
-    double R = (TRACK_H - 4) / 2.0;
-    double d = R * 1.5;
-    double total = 2.0 * R + d;
-    double margin = (TRACK_W - total) / 2.0;
-    double cx1 = margin + R;
-    double cy  = TRACK_H / 2.0;
-
-    double carX = cx1 - R + 0.5;
-    double carY = cy + 0.5;
-    double angle = 0.0;
-
-    if (!on_track(carX, carY)) {
-        /* Fallback: find any road cell */
-        int found = 0;
-        for (int y = 0; y < TRACK_H && !found; ++y) {
-            for (int x = 0; x < TRACK_W && !found; ++x) {
-                if (isRoad[y][x]) {
-                    carX = x + 0.5;
-                    carY = y + 0.5;
-                    found = 1;
-                }
-            }
-        }
-    }
-
-    double elapsed = 0.0;
-    int quit = 0;
-    int crashed = 0;
-
-    while (!quit && !crashed) {
-        double turnInput = 0.0;
-        handle_input(&turnInput, &quit);
-        angle += turnInput * TURN_RATE * DT;
-
-        double dx = cos(angle) * SPEED * DT;
-        double dy = sin(angle) * SPEED * DT;
-
-        double newX = carX + dx;
-        double newY = carY + dy;
-
-        if (!on_track(newX, newY)) {
-            crashed = 1;
-            render(carX, carY, elapsed, crashed);
-            break;
-        }
-
-        carX = newX;
-        carY = newY;
-        elapsed += DT;
-
-        render(carX, carY, elapsed, crashed);
-        usleep((useconds_t)(DT * 1000000.0));
-    }
-
-    /* Wait for Q after crash */
-    while (!quit) {
-        double dummyTurn = 0.0;
-        handle_input(&dummyTurn, &quit);
-        render(carX, carY, elapsed, crashed);
-        usleep(100000);
-    }
-
-    /* disable_raw_mode() will be called by atexit */
-    write(STDOUT_FILENO, "\n", 1);
     return 0;
+}
+
+void InitGame() {
+    player.x = 400;
+    player.y = 520;
+    player.vx = 0;
+    player.vy = 0;
+    player.angle = 0; // Facing right
+    player.nitro_fuel = 100;
+    player.color = RGB(255, 50, 50); // Red Truck
+}
+
+// Check if point is inside a rectangle
+int PointInRect(float x, float y, RECT r) {
+    return (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom);
+}
+
+void UpdatePhysics() {
+    if (GetAsyncKeyState(VK_ESCAPE)) game_running = 0;
+
+    // Steering
+    if (GetAsyncKeyState(VK_LEFT))  player.angle -= TURN_SPEED;
+    if (GetAsyncKeyState(VK_RIGHT)) player.angle += TURN_SPEED;
+
+    // Acceleration calculation
+    float rad = DEG2RAD(player.angle);
+    float dirX = cos(rad);
+    float dirY = sin(rad);
+
+    float current_accel = 0;
+
+    if (GetAsyncKeyState(VK_UP)) current_accel = ACCEL;
+    if (GetAsyncKeyState(VK_DOWN)) current_accel = -ACCEL * 0.5f; // Reverse is slower
+
+    // Nitro
+    if (GetAsyncKeyState(VK_SPACE) && player.nitro_fuel > 0) {
+        current_accel += NITRO_FORCE;
+        player.nitro_fuel--;
+    }
+
+    // Apply force to velocity
+    player.vx += dirX * current_accel;
+    player.vy += dirY * current_accel;
+
+    // Apply Drag (Friction)
+    // This creates the "sliding" feel. The car keeps moving in previous vector 
+    // even if the car rotates, until friction and new acceleration take over.
+    player.vx *= DRAG;
+    player.vy *= DRAG;
+
+    // Cap Speed
+    float speed = sqrt(player.vx*player.vx + player.vy*player.vy);
+    if (speed > MAX_SPEED) {
+        float scale = MAX_SPEED / speed;
+        player.vx *= scale;
+        player.vy *= scale;
+    }
+
+    // Update Position
+    float nextX = player.x + player.vx;
+    float nextY = player.y + player.vy;
+
+    // Collision Detection (Simple Bounding Box bounce)
+    int collision = 0;
+
+    // Outer Walls
+    if (nextX < 20 || nextX > SCREEN_W - 20) { player.vx *= -0.5f; collision = 1; }
+    if (nextY < 20 || nextY > SCREEN_H - 20) { player.vy *= -0.5f; collision = 1; }
+
+    // Inner Islands (The Figure 8 Holes)
+    // Slightly padded to give walls thickness
+    RECT r1 = island1; InflateRect(&r1, 10, 10);
+    RECT r2 = island2; InflateRect(&r2, 10, 10);
+
+    if (PointInRect(nextX, nextY, r1) || PointInRect(nextX, nextY, r2)) {
+        // Determine bounce direction (very simple approximation)
+        // If we are deep inside, just reverse velocity to prevent sticking
+        player.vx *= -0.6f;
+        player.vy *= -0.6f;
+        collision = 1;
+    }
+
+    if (!collision) {
+        player.x = nextX;
+        player.y = nextY;
+    }
+}
+
+void DrawRotatedRect(HDC hdc, float x, float y, float w, float h, float angle, COLORREF color) {
+    // Create points relative to center
+    float rad = DEG2RAD(angle);
+    float c = cos(rad);
+    float s = sin(rad);
+    
+    POINT pts[4];
+    float hw = w / 2.0f;
+    float hh = h / 2.0f;
+
+    // Corners relative to center
+    float cx[4] = { -hw, hw, hw, -hw };
+    float cy[4] = { -hh, -hh, hh, hh };
+
+    for (int i = 0; i < 4; i++) {
+        pts[i].x = (LONG)(x + (cx[i] * c - cy[i] * s));
+        pts[i].y = (LONG)(y + (cx[i] * s + cy[i] * c));
+    }
+
+    HBRUSH hBrush = CreateSolidBrush(color);
+    HBRUSH oldBrush = SelectObject(hdc, hBrush);
+    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0,0,0));
+    HPEN oldPen = SelectObject(hdc, hPen);
+
+    Polygon(hdc, pts, 4);
+
+    // Draw a windshield to indicate direction
+    POINT front[3];
+    front[0] = pts[1]; // Front Right
+    front[1] = pts[2]; // Front Left
+    // Center point slightly back
+    front[2].x = (LONG)(x + ((hw-6) * c - 0 * s)); 
+    front[2].y = (LONG)(y + ((hw-6) * s + 0 * c));
+    
+    HBRUSH winBrush = CreateSolidBrush(RGB(200, 240, 255));
+    SelectObject(hdc, winBrush);
+    Polygon(hdc, front, 3);
+
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(hBrush);
+    DeleteObject(winBrush);
+    DeleteObject(hPen);
+}
+
+void DrawGame(HDC hdc, RECT* clientRect) {
+    // Create Double Buffer to prevent flickering
+    HDC memDC = CreateCompatibleDC(hdc);
+    HBITMAP memBitmap = CreateCompatibleBitmap(hdc, clientRect->right, clientRect->bottom);
+    HBITMAP oldBitmap = SelectObject(memDC, memBitmap);
+
+    // --- Draw Background (Dirt) ---
+    HBRUSH dirtBrush = CreateSolidBrush(RGB(139, 69, 19)); // Brown
+    FillRect(memDC, clientRect, dirtBrush);
+    DeleteObject(dirtBrush);
+
+    // --- Draw Track Borders (Walls/Grass) ---
+    HBRUSH grassBrush = CreateSolidBrush(RGB(34, 139, 34)); // Forest Green
+    
+    // 1. Outer Boundary (Fill screen with grass, then draw dirt track on top? 
+    //    No, easier to draw dirt background then draw grass obstacles)
+    
+    // Draw border walls (Grass)
+    int border = 20;
+    RECT top = {0, 0, SCREEN_W, border};
+    RECT bot = {0, SCREEN_H-border, SCREEN_W, SCREEN_H};
+    RECT left = {0, 0, border, SCREEN_H};
+    RECT right = {SCREEN_W-border, 0, SCREEN_W, SCREEN_H};
+    
+    FillRect(memDC, &top, grassBrush);
+    FillRect(memDC, &bot, grassBrush);
+    FillRect(memDC, &left, grassBrush);
+    FillRect(memDC, &right, grassBrush);
+
+    // Draw Inner Islands (The Figure 8 shape)
+    FillRect(memDC, &island1, grassBrush);
+    FillRect(memDC, &island2, grassBrush);
+
+    // Draw Bumps / Haybales (Visual flair)
+    HBRUSH whiteBrush = CreateSolidBrush(RGB(220, 220, 220));
+    HBRUSH redBrush = CreateSolidBrush(RGB(200, 0, 0));
+    
+    RECT obstacles[] = { island1, island2 };
+    for(int k=0; k<2; k++) {
+        FrameRect(memDC, &obstacles[k], whiteBrush); // Simple outline
+    }
+
+    DeleteObject(grassBrush);
+    DeleteObject(whiteBrush);
+    DeleteObject(redBrush);
+
+    // --- Draw Start / Finish Line ---
+    // Bottom center
+    HBRUSH check1 = CreateSolidBrush(RGB(255,255,255));
+    HBRUSH check2 = CreateSolidBrush(RGB(0,0,0));
+    int startX = 380, startY = 480;
+    for(int i=0; i<4; i++) {
+        for(int j=0; j<2; j++) {
+            RECT c = {startX + i*10, startY + j*10, startX + (i+1)*10, startY + (j+1)*10};
+            FillRect(memDC, &c, ((i+j)%2) ? check1 : check2);
+        }
+    }
+    DeleteObject(check1);
+    DeleteObject(check2);
+
+    // --- Draw Shadow ---
+    DrawRotatedRect(memDC, player.x + 5, player.y + 5, CAR_LENGTH, CAR_WIDTH, player.angle, RGB(50, 20, 0));
+    
+    // --- Draw Player Car ---
+    DrawRotatedRect(memDC, player.x, player.y, CAR_LENGTH, CAR_WIDTH, player.angle, player.color);
+
+    // --- Draw UI ---
+    char buf[64];
+    sprintf(buf, "NITRO: %d", player.nitro_fuel);
+    SetBkMode(memDC, TRANSPARENT);
+    SetTextColor(memDC, RGB(255, 255, 0));
+    TextOut(memDC, 30, 30, buf, (int)strlen(buf));
+    
+    sprintf(buf, "WASD / ARROWS to Drive | SPACE for Nitro");
+    SetTextColor(memDC, RGB(255, 255, 255));
+    TextOut(memDC, 30, SCREEN_H - 50, buf, (int)strlen(buf));
+
+    // Copy buffer to screen
+    BitBlt(hdc, 0, 0, clientRect->right, clientRect->bottom, memDC, 0, 0, SRCCOPY);
+
+    // Cleanup
+    SelectObject(memDC, oldBitmap);
+    DeleteObject(memBitmap);
+    DeleteDC(memDC);
+}
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+        case WM_DESTROY:
+            game_running = 0;
+            PostQuitMessage(0);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1; // Prevent flickering
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
