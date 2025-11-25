@@ -1,224 +1,478 @@
 #include <stdio.h>
-#include <math.h>
-#include <unistd.h>
-#include <termios.h>
+#include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
-#define HEIGHT 25
-#define WIDTH  50
-#define NUM_CARS 4
+#define MAX_INPUT 100
+#define MAX_ITEMS 10
 
-struct termios oldt;
+/* Game state */
+typedef struct {
+    int current_room;
+    int inventory[MAX_ITEMS];
+    int inventory_count;
+    int lamp_on;
+    int door_unlocked;
+    int game_won;
+} GameState;
 
-void restore_terminal() {
-    tcsetattr(0, TCSANOW, &oldt);
-}
+/* Room definitions */
+typedef struct {
+    char *name;
+    char *description;
+    int north, south, east, west;
+    int items[MAX_ITEMS];
+    int item_count;
+    int dark;
+} Room;
 
-struct Car {
-    float x, y;
-    float angle;
-    float speed;      // forward speed
-    float sideslip;   // lateral velocity
-    char sym;
-    const char *color;
-    int lap;
-    int wp_idx;
-    int wrenches;
+/* Item definitions */
+typedef struct {
+    char *name;
+    char *description;
+    int id;
+} Item;
+
+enum {
+    ROOM_ENTRANCE,
+    ROOM_HALLWAY,
+    ROOM_LIBRARY,
+    ROOM_KITCHEN,
+    ROOM_CELLAR,
+    ROOM_TREASURE,
+    ROOM_COUNT
 };
 
-struct Car cars[NUM_CARS];
-char map[HEIGHT][WIDTH+1];
-
-const char *base_map[HEIGHT] = {
-    "##################################################",
-    "#*               ************************       *#",
-    "# ####   ####################################   #",
-    "# #  #   #                                 #   #",
-    "# #  #### #   ########################### #   #",
-    "# #       #   #                         # #   #",
-    "# #  ######   #   ##################### #  #   #",
-    "# #  #        #   #                   #    #   #",
-    "# #  #  ###### #  #  ################# #####   #",
-    "# #  #  #      #  #  #               #         #",
-    "# #  #  #  ###### #  #  ############ # ####### #",
-    "# #  #  #         #  #  #            # #       #",
-    "# #  #  ######### #  #  #  ######### # # #### #",
-    "# #  #            #  #  #            # # #  # #",
-    "# #  ############## #  #  ############ # #  # #",
-    "# #                 #  #                # #  # #",
-    "# #  ################ #  ################ #  # #",
-    "# #                   #                  #  # #",
-    "# ####  ##############################  ##  ###",
-    "#    #  #                            #  #     #",
-    "#    #  #################################     *#",
-    "#    #                                       * #",
-    "#    ############################################",
-    "#                                                #",
-    "##################################################"
+enum {
+    ITEM_LAMP,
+    ITEM_KEY,
+    ITEM_SWORD,
+    ITEM_BOOK,
+    ITEM_TREASURE,
+    ITEM_COUNT
 };
 
-typedef struct { float x, y; } Vec2;
+/* Global data */
+Room rooms[ROOM_COUNT];
+Item items[ITEM_COUNT];
+GameState state;
 
-Vec2 waypoints[] = {
-    {25,23},{30,23},{35,23},{40,21},{43,18},{43,15},{41,12},{37,9},{32,8},{25,8},
-    {18,9},{14,12},{12,15},{12,18},{15,21},{20,23},{25,23},{30,22},{35,20},{39,18},
-    {41,15},{40,11},{36,8},{30,8},{22,9},{17,12},{14,16},{14,20},{18,23},{24,23}
-};
-int n_wp = sizeof(waypoints)/sizeof(waypoints[0]);
+/* Function prototypes */
+void init_game(void);
+void print_room(void);
+void parse_command(char *input);
+void go(char *direction);
+void take(char *item_name);
+void drop(char *item_name);
+void use(char *item_name);
+void examine(char *item_name);
+void show_inventory(void);
+void show_help(void);
+char *str_tolower(char *str);
+int find_item_in_room(char *name);
+int find_item_in_inventory(char *name);
 
-void init() {
-    tcgetattr(0, &oldt);
-    struct termios newt = oldt;
-    newt.c_lflag &= ~(ICANON | ECHO);
-    newt.c_cc[VMIN] = 0;
-    newt.c_cc[VTIME] = 0;
-    tcsetattr(0, TCSANOW, &newt);
-    atexit(restore_terminal);
-
-    for(int y=0; y<HEIGHT; y++) strcpy(map[y], base_map[y]);
-
-    // Player (red '1') starts at bottom center facing right
-    cars[0] = (struct Car){25, 23, 0, 0, 0, '1', "\033[91m", 0, 0, 0};
-    // AI drones (blue, green, yellow)
-    cars[1] = (struct Car){24, 23.5, 0, 0, 0, '2', "\033[94m", 0, 5, 0};
-    cars[2] = (struct Car){26, 23.5, 0, 0, 0, '3', "\033[92m", 0, 10, 0};
-    cars[3] = (struct Car){25, 24.0, 0, 0, 0, '4', "\033[93m", 0, 15, 0};
-}
-
-int main() {
-    init();
-
-    while(1) {
-        // === INPUT (non-blocking, works with key repeat) ===
-        int left=0, right=0, gas=0, brake=0, quit=0;
-        char buf[32];
-        ssize_t n = read(0, buf, sizeof(buf));
-        for(ssize_t i=0; i<n; i++) {
-            if(buf[i]=='q' || buf[i]==27) quit = 1; // ESC or q
-            if(buf[i]=='\x1b' && i+2<n && buf[i+1]=='[') {
-                switch(buf[i+2]) {
-                    case 'A': gas=1; break;
-                    case 'B': brake=1; break;
-                    case 'C': right=1; break;
-                    case 'D': left=1; break;
-                }
-                i+=2;
-            }
-        }
-        if(quit) break;
-
-        // === UPDATE ALL CARS ===
-        for(int i=0; i<NUM_CARS; i++) {
-            struct Car *c = &cars[i];
-            int player = (i==0);
-
-            // ----- controls -----
-            int c_gas   = player ? gas   : 1;
-            int c_brake = player ? brake : 0;
-            int c_left  = player ? left  : 0;
-            int c_right = player ? right : 0;
-
-            // ----- AI steering (waypoint pursuit) -----
-            if(!player) {
-                int look = 4 + (int)(fabs(c->speed)/4);
-                int tid = (c->wp_idx + look) % n_wp;
-                float dx = waypoints[tid].x - c->x;
-                float dy = waypoints[tid].y - c->y;
-                float desired = atan2f(dy, dx);
-                float diff = desired - c->angle;
-                while(diff >  M_PI) diff -= 2*M_PI;
-                while(diff < -M_PI) diff += 2*M_PI;
-                c->angle += diff * 0.18f; // aggressive steering
-
-                // advance waypoint when close
-                dx = c->x - waypoints[c->wp_idx].x;
-                dy = c->y - waypoints[c->wp_idx].y;
-                if(dx*dx + dy*dy < 30) c->wp_idx = (c->wp_idx + 1) % n_wp;
-            }
-
-            // ----- physics (authentic Super Sprint feel) -----
-            int ix = (int)(c->x + 0.5f);
-            int iy = (int)(c->y + 0.5f);
-            int on_road = (ix>=0 && ix<WIDTH && iy>=0 && iy<HEIGHT && map[iy][ix]==' ');
-            int wall    = (ix<0 || ix>=WIDTH || iy<0 || iy>=HEIGHT || map[iy][ix]=='#');
-
-            if(wall) {
-                c->speed = c->sideslip = 0;           // crash → full stop + "explosion" feel
-            } else {
-                // acceleration / braking
-                if(c_gas)   c->speed += 0.45f;
-                if(c_brake) c->speed -= 0.90f;
-
-                // steering sharper at low speed (exactly like the arcade)
-                float steer_power = 0.13f / (fabs(c->speed)*0.07f + 1.0f);
-                if(c_left)  c->angle -= steer_power;
-                if(c_right) c->angle += steer_power;
-
-                // drag (heavier off-road)
-                c->speed *= on_road ? 0.990f : 0.960f;
-
-                // grip (high on road → kills sideways slide, low off-road → huge drifting)
-                float grip = on_road ? 0.25f : 0.04f;
-                c->sideslip *= (1.0f - grip);
-
-                // wrench collection & upgrade (every 3 wrenches = big boost)
-                if(map[iy][ix]=='*') {
-                    map[iy][ix] = ' ';
-                    if(player) {
-                        c->wrenches++;
-                        if(c->wrenches % 3 == 0) {
-                            // upgrade just like real Super Sprint!
-                            // (you'll feel each one instantly)
-                        }
-                    }
-                }
-            }
-
-            // max speed increases with upgrades
-            float max_spd = 13.0f + (c->wrenches/3)*4.0f;
-            if(c->speed > max_spd) c->speed = max_spd;
-
-            // apply velocity
-            float vx = c->speed * cosf(c->angle) - c->sideslip * sinf(c->angle);
-            float vy = c->speed * sinf(c->angle) + c->sideslip * cosf(c->angle);
-            c->x += vx * 0.03f;
-            c->y += vy * 0.03f;
-
-            // lap detection (crossing bottom finish line going roughly rightward)
-            static float prev_y[NUM_CARS];
-            if(prev_y[i] > 22.0f && c->y <= 22.0f && c->x > 15 && c->x < 35 && cosf(c->angle) > 0.3f)
-                c->lap++;
-            prev_y[i] = c->y;
-        }
-
-        // === RENDER ===
-        printf("\033[2J\033[H"); // clear + home
-        for(int y=0; y<HEIGHT; y++) {
-            for(int x=0; x<WIDTH; x++) {
-                char t = map[y][x];
-                int car_here = -1;
-                for(int i=0; i<NUM_CARS; i++) {
-                    if((int)(cars[i].x+0.5f)==x && (int)(cars[i].y+0.5f)==y)
-                        car_here = i;
-                }
-                if(car_here != -1) {
-                    printf("%s%c\033[0m", cars[car_here].color, cars[car_here].sym);
-                } else if(t=='#') {
-                    printf("\033[97m#\033[0m");     // white walls
-                } else if(t=='*') {
-                    printf("\033[93m*\033[0m");     // yellow wrench
-                } else if(t==' ') {
-                    printf("\033[100m \033[0m");    // dark gray road
-                } else {
-                    printf("\033[42m.\033[0m");     // green grass
-                }
-            }
-            printf("\n");
-        }
-        printf("\033[0mLap %d  Wrenches %d  Upgrades %d   (q or ESC to quit)\n",
-               cars[0].lap, cars[0].wrenches, cars[0].wrenches/3);
-
-        usleep(30000); // ~33 fps, feels exactly like the arcade
+int main(void) {
+    char input[MAX_INPUT];
+    
+    printf("========================================\n");
+    printf("   THE LOST TREASURE OF DARKWOOD MANOR\n");
+    printf("========================================\n");
+    printf("\nType 'help' for commands.\n\n");
+    
+    init_game();
+    print_room();
+    
+    while (!state.game_won) {
+        printf("\n> ");
+        if (fgets(input, MAX_INPUT, stdin) == NULL) break;
+        
+        input[strcspn(input, "\n")] = 0;
+        
+        if (strlen(input) == 0) continue;
+        
+        parse_command(input);
     }
+    
     return 0;
+}
+
+void init_game(void) {
+    /* Initialize game state */
+    state.current_room = ROOM_ENTRANCE;
+    state.inventory_count = 0;
+    state.lamp_on = 0;
+    state.door_unlocked = 0;
+    state.game_won = 0;
+    
+    /* Initialize items */
+    items[ITEM_LAMP] = (Item){"lamp", "A rusty oil lamp. It might still work.", ITEM_LAMP};
+    items[ITEM_KEY] = (Item){"key", "An ornate brass key with strange markings.", ITEM_KEY};
+    items[ITEM_SWORD] = (Item){"sword", "A decorative sword hanging on the wall.", ITEM_SWORD};
+    items[ITEM_BOOK] = (Item){"book", "A leather-bound book titled 'Secrets of the Manor'.", ITEM_BOOK};
+    items[ITEM_TREASURE] = (Item){"treasure", "A chest filled with gold and jewels!", ITEM_TREASURE};
+    
+    /* Initialize rooms */
+    rooms[ROOM_ENTRANCE] = (Room){
+        "Manor Entrance",
+        "You are standing in the dusty entrance hall of Darkwood Manor.\n"
+        "Cobwebs hang from the chandelier above. There is a hallway to the north.",
+        ROOM_HALLWAY, -1, -1, -1,
+        {ITEM_LAMP}, 1, 0
+    };
+    
+    rooms[ROOM_HALLWAY] = (Room){
+        "Main Hallway",
+        "A long, dark hallway stretches before you.\n"
+        "There are doorways to the east and west, and stairs leading down to the south.\n"
+        "The entrance is to the south.",
+        -1, ROOM_ENTRANCE, ROOM_LIBRARY, ROOM_KITCHEN,
+        {}, 0, 0
+    };
+    
+    rooms[ROOM_LIBRARY] = (Room){
+        "Library",
+        "You are in a library filled with ancient books.\n"
+        "A decorative sword hangs on the wall. The hallway is to the west.",
+        -1, -1, -1, ROOM_HALLWAY,
+        {ITEM_SWORD, ITEM_BOOK}, 2, 0
+    };
+    
+    rooms[ROOM_KITCHEN] = (Room){
+        "Kitchen",
+        "An old kitchen with rusty pots and pans.\n"
+        "There's a small key on the counter. The hallway is to the east.",
+        -1, -1, ROOM_HALLWAY, -1,
+        {ITEM_KEY}, 1, 0
+    };
+    
+    rooms[ROOM_CELLAR] = (Room){
+        "Dark Cellar",
+        "You are in a pitch-black cellar. You can't see anything!\n"
+        "Stairs lead up to the north.",
+        ROOM_HALLWAY, -1, -1, -1,
+        {}, 0, 1
+    };
+    
+    rooms[ROOM_TREASURE] = (Room){
+        "Treasure Room",
+        "You have found the secret treasure room!\n"
+        "A magnificent chest sits in the center of the room.",
+        -1, -1, -1, -1,
+        {ITEM_TREASURE}, 1, 0
+    };
+}
+
+void print_room(void) {
+    Room *room = &rooms[state.current_room];
+    
+    printf("\n=== %s ===\n", room->name);
+    
+    /* Check if room is dark and lamp is not on */
+    if (room->dark && !state.lamp_on) {
+        printf("It is pitch black. You might be eaten by a grue.\n");
+        return;
+    }
+    
+    printf("%s\n", room->description);
+    
+    /* List items in room */
+    if (room->item_count > 0) {
+        printf("\nYou can see:\n");
+        for (int i = 0; i < room->item_count; i++) {
+            printf("  - a %s\n", items[room->items[i]].name);
+        }
+    }
+}
+
+void parse_command(char *input) {
+    char *cmd = strtok(input, " ");
+    char *arg = strtok(NULL, " ");
+    
+    if (cmd == NULL) return;
+    
+    cmd = str_tolower(cmd);
+    
+    if (strcmp(cmd, "go") == 0 || strcmp(cmd, "n") == 0 || 
+        strcmp(cmd, "s") == 0 || strcmp(cmd, "e") == 0 || strcmp(cmd, "w") == 0) {
+        if (strcmp(cmd, "go") == 0) {
+            go(arg);
+        } else {
+            go(cmd);
+        }
+    } else if (strcmp(cmd, "north") == 0) {
+        go("n");
+    } else if (strcmp(cmd, "south") == 0) {
+        go("s");
+    } else if (strcmp(cmd, "east") == 0) {
+        go("e");
+    } else if (strcmp(cmd, "west") == 0) {
+        go("w");
+    } else if (strcmp(cmd, "take") == 0 || strcmp(cmd, "get") == 0) {
+        take(arg);
+    } else if (strcmp(cmd, "drop") == 0) {
+        drop(arg);
+    } else if (strcmp(cmd, "use") == 0) {
+        use(arg);
+    } else if (strcmp(cmd, "examine") == 0 || strcmp(cmd, "x") == 0) {
+        examine(arg);
+    } else if (strcmp(cmd, "inventory") == 0 || strcmp(cmd, "i") == 0) {
+        show_inventory();
+    } else if (strcmp(cmd, "look") == 0 || strcmp(cmd, "l") == 0) {
+        print_room();
+    } else if (strcmp(cmd, "help") == 0) {
+        show_help();
+    } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
+        printf("Thanks for playing!\n");
+        exit(0);
+    } else {
+        printf("I don't understand that command. Type 'help' for a list of commands.\n");
+    }
+}
+
+void go(char *direction) {
+    if (direction == NULL) {
+        printf("Go where?\n");
+        return;
+    }
+    
+    direction = str_tolower(direction);
+    
+    int new_room = -1;
+    Room *room = &rooms[state.current_room];
+    
+    if (strcmp(direction, "n") == 0 || strcmp(direction, "north") == 0) {
+        new_room = room->north;
+    } else if (strcmp(direction, "s") == 0 || strcmp(direction, "south") == 0) {
+        new_room = room->south;
+    } else if (strcmp(direction, "e") == 0 || strcmp(direction, "east") == 0) {
+        new_room = room->east;
+    } else if (strcmp(direction, "w") == 0 || strcmp(direction, "west") == 0) {
+        new_room = room->west;
+    } else {
+        printf("That's not a valid direction.\n");
+        return;
+    }
+    
+    /* Special case: going down to cellar from hallway */
+    if (state.current_room == ROOM_HALLWAY && 
+        (strcmp(direction, "down") == 0 || strcmp(direction, "d") == 0)) {
+        if (!state.door_unlocked) {
+            printf("The cellar door is locked. You need a key.\n");
+            return;
+        }
+        state.current_room = ROOM_CELLAR;
+        print_room();
+        return;
+    }
+    
+    if (new_room == -1) {
+        printf("You can't go that way.\n");
+        return;
+    }
+    
+    state.current_room = new_room;
+    print_room();
+}
+
+void take(char *item_name) {
+    if (item_name == NULL) {
+        printf("Take what?\n");
+        return;
+    }
+    
+    item_name = str_tolower(item_name);
+    
+    int item_index = find_item_in_room(item_name);
+    
+    if (item_index == -1) {
+        printf("There's no %s here.\n", item_name);
+        return;
+    }
+    
+    if (state.inventory_count >= MAX_ITEMS) {
+        printf("You're carrying too much!\n");
+        return;
+    }
+    
+    Room *room = &rooms[state.current_room];
+    int item_id = room->items[item_index];
+    
+    /* Add to inventory */
+    state.inventory[state.inventory_count++] = item_id;
+    
+    /* Remove from room */
+    for (int i = item_index; i < room->item_count - 1; i++) {
+        room->items[i] = room->items[i + 1];
+    }
+    room->item_count--;
+    
+    printf("Taken.\n");
+}
+
+void drop(char *item_name) {
+    if (item_name == NULL) {
+        printf("Drop what?\n");
+        return;
+    }
+    
+    item_name = str_tolower(item_name);
+    
+    int inv_index = find_item_in_inventory(item_name);
+    
+    if (inv_index == -1) {
+        printf("You don't have that.\n");
+        return;
+    }
+    
+    Room *room = &rooms[state.current_room];
+    int item_id = state.inventory[inv_index];
+    
+    /* Add to room */
+    room->items[room->item_count++] = item_id;
+    
+    /* Remove from inventory */
+    for (int i = inv_index; i < state.inventory_count - 1; i++) {
+        state.inventory[i] = state.inventory[i + 1];
+    }
+    state.inventory_count--;
+    
+    /* Turn off lamp if dropped */
+    if (item_id == ITEM_LAMP) {
+        state.lamp_on = 0;
+    }
+    
+    printf("Dropped.\n");
+}
+
+void use(char *item_name) {
+    if (item_name == NULL) {
+        printf("Use what?\n");
+        return;
+    }
+    
+    item_name = str_tolower(item_name);
+    
+    int inv_index = find_item_in_inventory(item_name);
+    
+    if (inv_index == -1) {
+        printf("You don't have that.\n");
+        return;
+    }
+    
+    int item_id = state.inventory[inv_index];
+    
+    if (item_id == ITEM_LAMP) {
+        state.lamp_on = !state.lamp_on;
+        printf("The lamp is now %s.\n", state.lamp_on ? "on" : "off");
+        if (state.current_room == ROOM_CELLAR) {
+            print_room();
+            if (state.lamp_on) {
+                printf("\nThe lamplight reveals a passage to the east!\n");
+            }
+        }
+    } else if (item_id == ITEM_KEY) {
+        if (state.current_room == ROOM_HALLWAY) {
+            printf("You unlock the cellar door with the key. You can now go down.\n");
+            state.door_unlocked = 1;
+        } else {
+            printf("There's nothing to unlock here.\n");
+        }
+    } else if (item_id == ITEM_SWORD) {
+        if (state.current_room == ROOM_CELLAR && state.lamp_on) {
+            printf("You swing the sword at the eastern wall. It crumbles, revealing a hidden room!\n");
+            rooms[ROOM_CELLAR].east = ROOM_TREASURE;
+        } else {
+            printf("You swing the sword around. Nothing happens.\n");
+        }
+    } else {
+        printf("You can't use that.\n");
+    }
+}
+
+void examine(char *item_name) {
+    if (item_name == NULL) {
+        print_room();
+        return;
+    }
+    
+    item_name = str_tolower(item_name);
+    
+    int inv_index = find_item_in_inventory(item_name);
+    int room_index = find_item_in_room(item_name);
+    
+    if (inv_index != -1) {
+        printf("%s\n", items[state.inventory[inv_index]].description);
+    } else if (room_index != -1) {
+        Room *room = &rooms[state.current_room];
+        printf("%s\n", items[room->items[room_index]].description);
+    } else {
+        printf("You don't see that here.\n");
+    }
+}
+
+void show_inventory(void) {
+    if (state.inventory_count == 0) {
+        printf("You're not carrying anything.\n");
+        return;
+    }
+    
+    printf("You are carrying:\n");
+    for (int i = 0; i < state.inventory_count; i++) {
+        printf("  - a %s\n", items[state.inventory[i]].name);
+    }
+}
+
+void show_help(void) {
+    printf("\nAvailable commands:\n");
+    printf("  go <direction>, n/s/e/w/north/south/east/west - Move in a direction\n");
+    printf("  take/get <item>     - Pick up an item\n");
+    printf("  drop <item>         - Drop an item\n");
+    printf("  use <item>          - Use an item\n");
+    printf("  examine/x <item>    - Examine an item\n");
+    printf("  inventory/i         - Show your inventory\n");
+    printf("  look/l              - Look around\n");
+    printf("  help                - Show this help\n");
+    printf("  quit/exit           - Quit the game\n");
+}
+
+char *str_tolower(char *str) {
+    static char buffer[MAX_INPUT];
+    int i = 0;
+    
+    if (str == NULL) return NULL;
+    
+    while (str[i] && i < MAX_INPUT - 1) {
+        buffer[i] = tolower(str[i]);
+        i++;
+    }
+    buffer[i] = '\0';
+    
+    return buffer;
+}
+
+int find_item_in_room(char *name) {
+    Room *room = &rooms[state.current_room];
+    
+    if (room->dark && !state.lamp_on) {
+        return -1;
+    }
+    
+    for (int i = 0; i < room->item_count; i++) {
+        if (strcmp(items[room->items[i]].name, name) == 0) {
+            return i;
+        }
+    }
+    
+    return -1;
+}
+
+int find_item_in_inventory(char *name) {
+    for (int i = 0; i < state.inventory_count; i++) {
+        if (strcmp(items[state.inventory[i]].name, name) == 0) {
+            return i;
+        }
+    }
+    
+    return -1;
 }
