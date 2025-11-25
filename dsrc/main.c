@@ -1,379 +1,430 @@
-/*
- * ASCII Super Sprint - single-file C, no external libraries.
- *
- * Controls:
- *   W = accelerate
- *   S = brake / reverse
- *   A = steer left
- *   D = steer right
- *   Q = quit
- *
- * Notes:
- *   - Uses ANSI escape codes for clearing the screen & hiding cursor.
- *   - On Windows 10+ this usually works out of the box. On very old
- *     consoles you may need to enable VT processing or it may flicker.
- */
+/* 
+   SUPER SPRINT CLONE - Single File C Program (Win32 API)
+   
+   Controls:
+   UP    - Accelerate
+   LEFT  - Steer Left
+   RIGHT - Steer Right
+   
+   Objective: Race 3 laps against the drones.
+*/
 
+#define _USE_MATH_DEFINES
+#include <windows.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
-#include <stdbool.h>
 #include <time.h>
 
-#ifdef _WIN32
-#  include <conio.h>
-#  include <windows.h>
-#else
-#  include <termios.h>
-#  include <unistd.h>
-#endif
+// --- Constants ---
+#define SCR_W 800
+#define SCR_H 600
+#define PI 3.14159265f
+#define MAX_CARS 4
+#define PLAYER_IDX 0
 
-#ifndef M_PI
-#  define M_PI 3.14159265358979323846
-#endif
+// Physics Tuning
+#define ACCEL 0.15f
+#define TURN_SPEED 0.06f
+#define FRICTION 0.975f
+#define WALL_BOUNCE -0.5f
+#define MAX_SPEED 7.0f
 
-/* Track dimensions (characters) */
-#define TRACK_W 60
-#define TRACK_H 20
-
-/* Simulation parameters */
-#define FRAME_MS   16        /* ~60 FPS */
-#define DT         0.016f    /* seconds per frame */
-#define MAX_LAPS   3
-
-/* Finish line placement (must match init_track) */
-#define FINISH_X   10
-#define FINISH_Y1  6
-#define FINISH_Y2  (TRACK_H - 7)
-
-/* Global track definition */
-static char track[TRACK_H][TRACK_W];
-
-/* Car state */
+// --- Structs ---
 typedef struct {
-    float x, y;     /* position in track coordinates (columns, rows) */
-    float speed;    /* scalar speed, can be negative (reverse) */
-    float angle;    /* facing angle in radians, 0 = right, pi/2 = down */
+    float x, y;
+    float vx, vy;
+    float angle;      // Heading angle in radians
+    COLORREF color;
+    int is_ai;
+    int current_checkpoint;
+    int laps;
+    int rank;         // 0 = racing, >0 = finished position
 } Car;
 
-#ifdef _WIN32
+typedef struct {
+    float x, y;
+    float radius;
+} Checkpoint;
 
-static void sleep_ms(int ms) {
-    Sleep(ms);
+// --- Global State ---
+Car cars[MAX_CARS];
+int total_finished = 0;
+int game_over = 0;
+int width, height;
+
+// Track Definition (Simple loop using math bounds)
+// We define the track as the space between two rounded rectangles
+float track_cx = SCR_W / 2.0f;
+float track_cy = SCR_H / 2.0f;
+float track_w = SCR_W * 0.85f;
+float track_h = SCR_H * 0.80f;
+float track_width = 90.0f; 
+
+// AI Waypoints (Simple path following)
+#define NUM_WAYPOINTS 8
+float waypoints[NUM_WAYPOINTS][2];
+
+// --- Helper Functions ---
+
+float dist(float x1, float y1, float x2, float y2) {
+    return sqrtf((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
 }
 
-static int getch_nowait(void) {
-    if (_kbhit())
-        return _getch();
-    return -1;
-}
+// Initialize Game
+void InitGame() {
+    srand((unsigned int)time(NULL));
 
-#else /* POSIX ---------------------------------------------------- */
+    // Setup Cars
+    // Player (Blue)
+    cars[0].x = SCR_W / 2.0f; cars[0].y = SCR_H - 60.0f;
+    cars[0].color = RGB(0, 100, 255);
+    cars[0].is_ai = 0;
 
-static struct termios orig_termios;
-static bool termios_initialized = false;
+    // AI (Red)
+    cars[1].x = SCR_W / 2.0f - 30; cars[1].y = SCR_H - 40.0f;
+    cars[1].color = RGB(255, 50, 50); 
+    cars[1].is_ai = 1;
 
-static void disable_raw_mode(void) {
-    if (termios_initialized) {
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-        termios_initialized = false;
+    // AI (Yellow)
+    cars[2].x = SCR_W / 2.0f + 30; cars[2].y = SCR_H - 40.0f;
+    cars[2].color = RGB(255, 200, 0);
+    cars[2].is_ai = 1;
+
+    // AI (Green)
+    cars[3].x = SCR_W / 2.0f + 60; cars[3].y = SCR_H - 60.0f;
+    cars[3].color = RGB(50, 200, 50);
+    cars[3].is_ai = 1;
+
+    for(int i=0; i<MAX_CARS; i++) {
+        cars[i].vx = 0; cars[i].vy = 0;
+        cars[i].angle = -PI / 2; // Pointing Up? No, Screen Y is down. -PI/2 is Up.
+        cars[i].laps = 0;
+        cars[i].current_checkpoint = 0;
+        cars[i].rank = 0;
     }
+
+    // Setup Waypoints for AI (A rough loop around the screen)
+    // 1. Top Middle
+    waypoints[0][0] = SCR_W/2; waypoints[0][1] = 60;
+    // 2. Top Left Corner
+    waypoints[1][0] = 80;      waypoints[1][1] = 80;
+    // 3. Left Middle
+    waypoints[2][0] = 60;      waypoints[2][1] = SCR_H/2;
+    // 4. Bottom Left Corner
+    waypoints[3][0] = 80;      waypoints[3][1] = SCR_H - 80;
+    // 5. Bottom Middle
+    waypoints[4][0] = SCR_W/2; waypoints[4][1] = SCR_H - 60;
+    // 6. Bottom Right Corner
+    waypoints[5][0] = SCR_W-80;waypoints[5][1] = SCR_H - 80;
+    // 7. Right Middle
+    waypoints[6][0] = SCR_W-60;waypoints[6][1] = SCR_H/2;
+    // 8. Top Right Corner
+    waypoints[7][0] = SCR_W-80;waypoints[7][1] = 80;
 }
 
-static void enable_raw_mode(void) {
-    if (termios_initialized)
-        return;
+// Check Collision with Track Walls
+int IsPointOnTrack(float x, float y) {
+    // Simple Signed Distance Field approximation for a rounded rectangle track
+    // We define a "center" box and check distance from it.
+    
+    float half_w = (track_w - track_width*2) / 2.0f;
+    float half_h = (track_h - track_width*2) / 2.0f;
 
-    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) {
-        perror("tcgetattr");
-        exit(1);
-    }
+    // Calculate distance from center of screen relative to the "inner block" dimensions
+    float dx = fabsf(x - track_cx);
+    float dy = fabsf(y - track_cy);
 
-    struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON);
-    raw.c_cc[VMIN]  = 0;
-    raw.c_cc[VTIME] = 0;
-
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
-        perror("tcsetattr");
-        exit(1);
-    }
-
-    termios_initialized = true;
-    atexit(disable_raw_mode);
+    // This logic creates a donut shape. 
+    // It's simplified. We just want to know if we are INSIDE the outer wall AND OUTSIDE the inner island.
+    
+    // Outer boundary check (Rounded rect)
+    float outer_rx = track_w / 2.0f;
+    float outer_ry = track_h / 2.0f;
+    
+    // Normalized coordinates for ellipse-ish check
+    // A robust way without complex math is difficult, so we use a simple logic:
+    // Track is the space between Inner Box and Outer Box.
+    
+    // Determine distance from the "Center Line" of the track loop
+    // Logic: Clamp point to the rectangle defined by the track's spine, measure dist.
+    float spine_w = (track_w - track_width) / 2.0f;
+    float spine_h = (track_h - track_width) / 2.0f;
+    
+    float cx = (x > track_cx + spine_w) ? track_cx + spine_w : (x < track_cx - spine_w) ? track_cx - spine_w : x;
+    float cy = (y > track_cy + spine_h) ? track_cy + spine_h : (y < track_cy - spine_h) ? track_cy - spine_h : y;
+    
+    float d = dist(x, y, cx, cy);
+    
+    // track_width is the full width. Half of it is the radius from the spine.
+    return (d < track_width / 2.0f);
 }
 
-static int getch_nowait(void) {
-    unsigned char c;
-    int n = (int)read(STDIN_FILENO, &c, 1);
-    if (n == 1)
-        return (int)c;
-    return -1;
-}
+void UpdatePhysics() {
+    for(int i=0; i<MAX_CARS; i++) {
+        if(cars[i].rank > 0) continue; // Finished race
 
-static void sleep_ms(int ms) {
-    usleep(ms * 1000);
-}
+        Car *c = &cars[i];
 
-#endif /* POSIX end ------------------------------------------------ */
+        // --- AI Logic ---
+        if (c->is_ai) {
+            // Target current waypoint
+            float tx = waypoints[c->current_checkpoint][0];
+            float ty = waypoints[c->current_checkpoint][1];
+            
+            // Angle to target
+            float target_angle = atan2f(ty - c->y, tx - c->x);
+            
+            // Smooth steering toward target
+            float diff = target_angle - c->angle;
+            while (diff <= -PI) diff += 2*PI;
+            while (diff > PI) diff -= 2*PI;
+            
+            if (diff > 0) c->angle += TURN_SPEED * 0.8f;
+            else c->angle -= TURN_SPEED * 0.8f;
+            
+            // AI Accelerates if looking roughly at target
+            float speed = sqrtf(c->vx*c->vx + c->vy*c->vy);
+            if (fabsf(diff) < PI/2 && speed < MAX_SPEED * 0.9f) {
+                c->vx += cosf(c->angle) * ACCEL;
+                c->vy += sinf(c->angle) * ACCEL;
+            }
 
-/* Cursor visibility */
-static void hide_cursor(void) {
-    printf("\x1b[?25l");
-    fflush(stdout);
-}
-
-static void show_cursor(void) {
-    printf("\x1b[?25h");
-    fflush(stdout);
-}
-
-/* Initialize a simple single-screen track with a central island and a finish line. */
-static void init_track(void) {
-    int x, y;
-
-    /* Base: outer walls, interior drivable '.' */
-    for (y = 0; y < TRACK_H; ++y) {
-        for (x = 0; x < TRACK_W; ++x) {
-            if (x == 0 || x == TRACK_W - 1 || y == 0 || y == TRACK_H - 1)
-                track[y][x] = '#';    /* outer wall */
-            else
-                track[y][x] = '.';    /* road */
+            // Check waypoint arrival
+            if (dist(c->x, c->y, tx, ty) < 80.0f) {
+                c->current_checkpoint++;
+                // Waypoints go 5->6->7->0->1... (Counter Clockwise logic based on array)
+                // The array defined in Init is somewhat arbitrary, let's fix navigation order:
+                // 4(bot) -> 5(br) -> 6(r) -> 7(tr) -> 0(t) -> 1(tl) -> 2(l) -> 3(bl) -> 4...
+                // Actually the array is: 0(TM), 1(TL), 2(LM), 3(BL), 4(BM), 5(BR), 6(RM), 7(TR)
+                // Standard race direction is Counter-Clockwise.
+                // Start is at Bottom. So 4 -> 5 -> 6 -> 7 -> 0 -> 1 -> 2 -> 3 -> 4
+                
+                // Correcting logic for simple array cycling
+                if (c->current_checkpoint >= NUM_WAYPOINTS) c->current_checkpoint = 0;
+            }
         }
-    }
-
-    /* Central island to force a loop */
-    int island_left  = 20;
-    int island_right = TRACK_W - 20;        /* 40 when TRACK_W=60 */
-    int island_top   = 4;
-    int island_bot   = TRACK_H - 5;         /* 15 when TRACK_H=20 */
-
-    for (y = island_top; y <= island_bot; ++y) {
-        for (x = island_left; x <= island_right; ++x) {
-            track[y][x] = '#';
-        }
-    }
-
-    /* Finish line: vertical stripe on the left corridor */
-    for (y = FINISH_Y1; y <= FINISH_Y2; ++y) {
-        track[y][FINISH_X] = '|';
-    }
-}
-
-/* Car physics update: acceleration, friction, turning, movement */
-static void update_car(Car *car, float dt, int accel, int brake, int left, int right) {
-    const float MAX_SPEED     = 18.0f;  /* cells per second */
-    const float ACCELERATION  = 25.0f;  /* accel strength */
-    const float BRAKE_POWER   = 35.0f;  /* brake strength */
-    const float FRICTION      = 8.0f;   /* natural drag */
-    const float BASE_TURN_RATE= 2.8f;   /* radians per second */
-
-    /* Longitudinal acceleration/braking */
-    if (accel)
-        car->speed += ACCELERATION * dt;
-    if (brake)
-        car->speed -= BRAKE_POWER * dt;
-
-    /* Clamp forward/backward speeds */
-    if (car->speed > MAX_SPEED)
-        car->speed = MAX_SPEED;
-    if (car->speed < -MAX_SPEED * 0.5f)
-        car->speed = -MAX_SPEED * 0.5f;
-
-    /* Friction */
-    if (car->speed > 0.0f) {
-        car->speed -= FRICTION * dt;
-        if (car->speed < 0.0f)
-            car->speed = 0.0f;
-    } else if (car->speed < 0.0f) {
-        car->speed += FRICTION * dt;
-        if (car->speed > 0.0f)
-            car->speed = 0.0f;
-    }
-
-    /* Turning: stronger effect at higher speed */
-    float turn_factor = 0.3f + 0.7f * (fabsf(car->speed) / MAX_SPEED);
-    float turn_amount = BASE_TURN_RATE * turn_factor * dt;
-
-    if (left)
-        car->angle -= turn_amount;
-    if (right)
-        car->angle += turn_amount;
-
-    /* Keep angle in reasonable range */
-    if (car->angle > (float)M_PI)
-        car->angle -= 2.0f * (float)M_PI;
-    else if (car->angle < -(float)M_PI)
-        car->angle += 2.0f * (float)M_PI;
-
-    /* Move forward along heading */
-    car->x += cosf(car->angle) * car->speed * dt;
-    car->y += sinf(car->angle) * car->speed * dt;
-}
-
-/* Render track + car */
-static void draw(const Car *car, int laps_done, float total_time) {
-    char buf[TRACK_H][TRACK_W];
-    int x, y;
-
-    /* Copy track to buffer */
-    for (y = 0; y < TRACK_H; ++y) {
-        for (x = 0; x < TRACK_W; ++x) {
-            buf[y][x] = track[y][x];
-        }
-    }
-
-    /* Overlay car */
-    int cx = (int)(car->x + 0.5f);
-    int cy = (int)(car->y + 0.5f);
-
-    if (cx >= 0 && cx < TRACK_W && cy >= 0 && cy < TRACK_H) {
-        buf[cy][cx] = '1'; /* player car */
-    }
-
-    /* Clear screen & move cursor home */
-    printf("\x1b[2J\x1b[H");
-
-    /* Simple HUD */
-    printf("ASCII Super Sprint  |  WASD: drive   Q: quit\n");
-    if (laps_done < MAX_LAPS) {
-        printf("Lap: %d / %d   Time: %.1f s   Speed: %.1f\n\n",
-               laps_done + 1, MAX_LAPS, total_time, fabsf(car->speed));
-    } else {
-        printf("Lap: %d / %d   Time: %.1f s   Speed: %.1f\n\n",
-               MAX_LAPS, MAX_LAPS, total_time, fabsf(car->speed));
-    }
-
-    /* Print track */
-    for (y = 0; y < TRACK_H; ++y) {
-        for (x = 0; x < TRACK_W; ++x) {
-            putchar(buf[y][x]);
-        }
-        putchar('\n');
-    }
-
-    fflush(stdout);
-}
-
-int main(void) {
-#ifdef _WIN32
-    /* Windows: console mode is already suitable for _getch/_kbhit */
-#else
-    enable_raw_mode();
-#endif
-
-    atexit(show_cursor);
-    hide_cursor();
-
-    init_track();
-
-    Car car;
-    car.x = 5.0f;                                       /* start left of finish line */
-    car.y = (FINISH_Y1 + FINISH_Y2) * 0.5f;             /* centered vertically on it */
-    car.speed = 0.0f;
-    car.angle = 0.0f;                                   /* facing right */
-
-    float total_time = 0.0f;
-    float lap_times[MAX_LAPS] = {0};
-    float last_lap_time = 0.0f;
-    int   laps_done = 0;
-    bool  race_finished = false;
-    bool  quit = false;
-
-    while (!quit && !race_finished) {
-        int accel = 0, brake = 0, left = 0, right = 0;
-
-        /* Accumulate time (fixed timestep) */
-        total_time += DT;
-
-        /* Read all keypresses available this frame */
-        for (;;) {
-            int c = getch_nowait();
-            if (c == -1)
-                break;
-
-            if (c == 'q' || c == 'Q') {
-                quit = true;
-                break;
-            } else if (c == 'w' || c == 'W') {
-                accel = 1;
-            } else if (c == 's' || c == 'S') {
-                brake = 1;
-            } else if (c == 'a' || c == 'A') {
-                left = 1;
-            } else if (c == 'd' || c == 'D') {
-                right = 1;
+        // --- Player Logic ---
+        else {
+            if (GetAsyncKeyState(VK_LEFT)) c->angle -= TURN_SPEED;
+            if (GetAsyncKeyState(VK_RIGHT)) c->angle += TURN_SPEED;
+            if (GetAsyncKeyState(VK_UP)) {
+                c->vx += cosf(c->angle) * ACCEL;
+                c->vy += sinf(c->angle) * ACCEL;
             }
         }
 
-        float old_x = car.x;
-        float old_y = car.y;
+        // --- Physics Integration ---
+        c->vx *= FRICTION;
+        c->vy *= FRICTION;
+        
+        float speed = sqrtf(c->vx*c->vx + c->vy*c->vy);
+        if (speed > MAX_SPEED) {
+            float ratio = MAX_SPEED / speed;
+            c->vx *= ratio;
+            c->vy *= ratio;
+        }
 
-        /* Physics update */
-        update_car(&car, DT, accel, brake, left, right);
+        float next_x = c->x + c->vx;
+        float next_y = c->y + c->vy;
 
-        /* Clamp to playable area (just inside outer walls) */
-        if (car.x < 1.0f) car.x = 1.0f;
-        if (car.x > (float)(TRACK_W - 2)) car.x = (float)(TRACK_W - 2);
-        if (car.y < 1.0f) car.y = 1.0f;
-        if (car.y > (float)(TRACK_H - 2)) car.y = (float)(TRACK_H - 2);
+        // --- Collision ---
+        // Check track boundaries
+        if (!IsPointOnTrack(next_x, next_y)) {
+            // Bounce
+            c->vx *= WALL_BOUNCE;
+            c->vy *= WALL_BOUNCE;
+            // Nudge back
+            c->x += c->vx; 
+            c->y += c->vy;
+        } else {
+            c->x = next_x;
+            c->y = next_y;
+        }
 
-        /* Wall collision against '#' tiles */
-        {
-            int ix = (int)(car.x + 0.5f);
-            int iy = (int)(car.y + 0.5f);
+        // --- Lap Counting Logic ---
+        // Check crossing the finish line (Bottom center, moving right)
+        // Line is roughly x=SCR_W/2, y > SCR_H - 100
+        if (c->y > SCR_H - 100 && c->x > SCR_W/2 && (c->x - c->vx) <= SCR_W/2) {
+            // Must have completed waypoints to prevent oscillating on line
+            // Simple debounce: Ensure we were on the left side recently? 
+            // For this simple version, just increment.
+             c->laps++;
+             if (c->laps > 3) {
+                 total_finished++;
+                 c->rank = total_finished;
+                 if (!c->is_ai) {
+                     char msg[64];
+                     sprintf(msg, "You finished! Rank: %d", c->rank);
+                     MessageBoxA(NULL, msg, "Race Over", MB_OK);
+                     InitGame(); // Reset
+                     return;
+                 }
+             }
+        }
+    }
+}
 
-            if (ix < 0) ix = 0;
-            if (ix >= TRACK_W) ix = TRACK_W - 1;
-            if (iy < 0) iy = 0;
-            if (iy >= TRACK_H) iy = TRACK_H - 1;
+void DrawRotatedRect(HDC hdc, float x, float y, float angle, COLORREF color) {
+    // Create a brush and pen
+    HBRUSH hBrush = CreateSolidBrush(color);
+    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0,0,0));
+    HGDIOBJ oldBrush = SelectObject(hdc, hBrush);
+    HGDIOBJ oldPen = SelectObject(hdc, hPen);
 
-            if (track[iy][ix] == '#') {
-                /* Simple bounce: step back and lose speed */
-                car.x = old_x;
-                car.y = old_y;
-                car.speed *= -0.3f;
+    // Car dimensions
+    float cw = 20.0f; // Length
+    float ch = 10.0f; // Width
+
+    POINT pts[4];
+    // Corners relative to center (0,0) before rotation
+    float cx[4] = { cw/2, cw/2, -cw/2, -cw/2 };
+    float cy[4] = { ch/2, -ch/2, -ch/2, ch/2 };
+
+    for(int i=0; i<4; i++) {
+        // Rotate
+        float rx = cx[i] * cosf(angle) - cy[i] * sinf(angle);
+        float ry = cx[i] * sinf(angle) + cy[i] * cosf(angle);
+        // Translate
+        pts[i].x = (LONG)(x + rx);
+        pts[i].y = (LONG)(y + ry);
+    }
+
+    Polygon(hdc, pts, 4);
+    
+    // Draw a small "spoiler" or stripe to indicate direction
+    MoveToEx(hdc, pts[2].x, pts[2].y, NULL);
+    LineTo(hdc, pts[3].x, pts[3].y);
+
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(hBrush);
+    DeleteObject(hPen);
+}
+
+void DrawTrack(HDC hdc) {
+    // 1. Fill Background (Grass)
+    HBRUSH grass = CreateSolidBrush(RGB(30, 100, 30));
+    RECT rc = {0, 0, SCR_W, SCR_H};
+    FillRect(hdc, &rc, grass);
+    DeleteObject(grass);
+
+    // 2. Draw Track (Asphalt)
+    HBRUSH asphalt = CreateSolidBrush(RGB(80, 80, 80));
+    HGDIOBJ old = SelectObject(hdc, asphalt);
+    
+    // Draw segments (Rectangles and Ellipses to form the loop)
+    float spine_w = (track_w - track_width) / 2.0f;
+    float spine_h = (track_h - track_width) / 2.0f;
+    float half_tw = track_width / 2.0f;
+
+    // We draw the track by drawing a thick pen line? No, GDI lines are square ended.
+    // Let's use geometry: Two rounded rects.
+    
+    // Outer Border
+    HPEN borderPen = CreatePen(PS_SOLID, 2, RGB(200, 200, 200));
+    SelectObject(hdc, borderPen);
+    RoundRect(hdc, 
+        (int)(track_cx - spine_w - half_tw), (int)(track_cy - spine_h - half_tw),
+        (int)(track_cx + spine_w + half_tw), (int)(track_cy + spine_h + half_tw),
+        (int)track_width, (int)track_width);
+
+    // Inner Island (Grass)
+    SelectObject(hdc, grass); // Reuse grass color but new brush needed if deleted?
+    HBRUSH grass2 = CreateSolidBrush(RGB(30, 100, 30));
+    SelectObject(hdc, grass2);
+    RoundRect(hdc, 
+        (int)(track_cx - spine_w + half_tw), (int)(track_cy - spine_h + half_tw),
+        (int)(track_cx + spine_w - half_tw), (int)(track_cy + spine_h - half_tw),
+        (int)(track_width/2), (int)(track_width/2));
+    
+    DeleteObject(grass2);
+    SelectObject(hdc, old);
+    DeleteObject(asphalt);
+    DeleteObject(borderPen);
+
+    // Draw Start/Finish Line
+    HPEN linePen = CreatePen(PS_SOLID, 3, RGB(255, 255, 255));
+    SelectObject(hdc, linePen);
+    MoveToEx(hdc, (int)track_cx, (int)(SCR_H - (SCR_H-track_h)/2), NULL);
+    LineTo(hdc, (int)track_cx, (int)(SCR_H - (SCR_H-track_h)/2 - track_width), NULL); // Not precise but visual enough
+    DeleteObject(linePen);
+}
+
+void Render(HDC hdc) {
+    // Create Double Buffer
+    HDC memDC = CreateCompatibleDC(hdc);
+    HBITMAP memBM = CreateCompatibleBitmap(hdc, SCR_W, SCR_H);
+    HGDIOBJ oldBM = SelectObject(memDC, memBM);
+
+    DrawTrack(memDC);
+
+    // Draw Cars
+    for(int i=0; i<MAX_CARS; i++) {
+        DrawRotatedRect(memDC, cars[i].x, cars[i].y, cars[i].angle, cars[i].color);
+    }
+
+    // Draw HUD
+    char hud[32];
+    SetBkMode(memDC, TRANSPARENT);
+    SetTextColor(memDC, RGB(255, 255, 255));
+    sprintf(hud, "LAP: %d/3", cars[0].laps > 3 ? 3 : cars[0].laps);
+    TextOutA(memDC, 10, 10, hud, strlen(hud));
+
+    // Blit to Screen
+    BitBlt(hdc, 0, 0, SCR_W, SCR_H, memDC, 0, 0, SRCCOPY);
+
+    // Cleanup
+    SelectObject(memDC, oldBM);
+    DeleteObject(memBM);
+    DeleteDC(memDC);
+}
+
+// --- Window Procedure ---
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch(msg) {
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+        case WM_KEYDOWN:
+            if(wParam == VK_ESCAPE) PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// --- Main Entry Point ---
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, "SuperSprint", NULL };
+    RegisterClassEx(&wc);
+    HWND hwnd = CreateWindow(wc.lpszClassName, "Super Sprint Clone", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 100, 100, SCR_W, SCR_H, NULL, NULL, wc.hInstance, NULL);
+
+    InitGame();
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
+
+    MSG msg = {0};
+    HDC hdc = GetDC(hwnd);
+    
+    DWORD lastTime = GetTickCount();
+
+    while(msg.message != WM_QUIT) {
+        if(PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        } else {
+            // Game Loop - Cap at ~60 FPS
+            DWORD currentTime = GetTickCount();
+            if (currentTime - lastTime > 16) {
+                UpdatePhysics();
+                Render(hdc);
+                lastTime = currentTime;
             }
+            Sleep(1); // Prevent CPU hogging
         }
-
-        /* Lap detection: crossing finish line from left to right within band */
-        if (!race_finished &&
-            old_x < (float)FINISH_X &&
-            car.x >= (float)FINISH_X &&
-            car.y >= (float)FINISH_Y1 &&
-            car.y <= (float)FINISH_Y2 &&
-            laps_done < MAX_LAPS) {
-
-            float this_lap = total_time - last_lap_time;
-            lap_times[laps_done] = this_lap;
-            last_lap_time = total_time;
-            laps_done++;
-
-            if (laps_done >= MAX_LAPS)
-                race_finished = true;
-        }
-
-        /* Draw frame */
-        draw(&car, laps_done, total_time);
-
-        /* Frame pacing */
-        sleep_ms(FRAME_MS);
     }
 
-#ifndef _WIN32
-    disable_raw_mode();
-#endif
-    show_cursor();
-
-    printf("\n");
-    if (race_finished) {
-        printf("Race finished in %.2f seconds!\n", total_time);
-        for (int i = 0; i < laps_done; ++i) {
-            printf("  Lap %d: %.2f s\n", i + 1, lap_times[i]);
-        }
-    } else if (quit) {
-        printf("Race aborted.\n");
-    }
-
+    ReleaseDC(hwnd, hdc);
+    UnregisterClass(wc.lpszClassName, wc.hInstance);
     return 0;
 }
